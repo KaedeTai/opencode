@@ -903,6 +903,18 @@
         "typescript": "catalog:",
       },
     },
+    "packages/websocket": {
+      "name": "@opencode-ai/websocket",
+      "version": "1.0.0",
+      "dependencies": {
+        "@opencode-ai/sdk": "workspace:*",
+      },
+      "devDependencies": {
+        "@types/node": "catalog:",
+        "@typescript/native-preview": "catalog:",
+        "typescript": "catalog:",
+      },
+    },
   },
   "trustedDependencies": [
     "esbuild",
@@ -1823,6 +1835,8 @@
     "@opencode-ai/ui": ["@opencode-ai/ui@workspace:packages/ui"],
 
     "@opencode-ai/web": ["@opencode-ai/web@workspace:packages/web"],
+
+    "@opencode-ai/websocket": ["@opencode-ai/websocket@workspace:packages/websocket"],
 
     "@openrouter/ai-sdk-provider": ["@openrouter/ai-sdk-provider@2.9.0", "", { "peerDependencies": { "ai": "^6.0.0", "zod": "^3.25.0 || ^4.0.0" } }, "sha512-Seva+NCa0WUQnJIUE5GzHsUv1WTIeyqwz0ELl2VtS6NP+eF+77yCXGFVOMbvoCM7QMjlnhv7931e89R+8pJdcQ=="],
 
