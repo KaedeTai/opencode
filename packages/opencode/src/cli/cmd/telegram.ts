@@ -2,15 +2,11 @@ import { Effect } from "effect"
 import { UI } from "../ui"
 import { effectCmd, fail, CliError } from "../effect-cmd"
 import { withNetworkOptions, resolveNetworkOptions } from "../network"
+import type { NetworkOptions } from "../network"
 
-type TelegramArgs = {
+type TelegramArgs = NetworkOptions & {
   token?: string
   allowedUsers?: string
-  hostname?: string
-  port?: number
-  mdns?: boolean
-  mdnsDomain?: string
-  cors?: boolean
   readonly _: Array<string | number>
 }
 
@@ -59,18 +55,18 @@ export const TelegramCommand = effectCmd({
     const client = createOpencodeClient({ baseUrl: server.url.toString() })
 
     // ── Telegraf bot ──────────────────────────────────────────────
-    const { Telegraf } = yield* Effect.promise(() => import("telegraf"))
-    const bot = new Telegraf(token)
+    const { Telegraf, Markup } = yield* Effect.promise(() => import("telegraf"))
+    const bot = new Telegraf(token) as any
 
     // ── Session map ───────────────────────────────────────────────
-    const sessions = new Map<string, { sessionId: string; lastSent: string | null; lastReasoning: string | null }>()
+    const sessions = new Map<string, { sessionId: string; lastSent: string | null; lastReasoning: string | null; userPrompt: string | null }>()
 
     // ── Helpers ───────────────────────────────────────────────────
     async function createSession(chatId: string) {
       const res = await client.session.create({ body: { title: `Telegram ${chatId}` } })
       if (res.error) return null
       const sessionId = res.data.id
-      sessions.set(chatId, { sessionId, lastSent: null, lastReasoning: null })
+      sessions.set(chatId, { sessionId, lastSent: null, lastReasoning: null, userPrompt: null })
       return sessionId
     }
 
@@ -89,17 +85,31 @@ export const TelegramCommand = effectCmd({
       return s.length > n ? s.slice(0, n - 3) + "..." : s
     }
 
+    async function send(cid: string, msg: string) {
+      bot.telegram.sendMessage(cid, trunc(msg, 4000)).catch(() => {})
+    }
+
+    async function reply(cid: string, msg: string, extras?: any) {
+      bot.telegram.sendMessage(cid, msg, extras).catch(() => {})
+    }
+
     // ── Commands ──────────────────────────────────────────────────
 
     bot.start(async (ctx: any) => {
       const cid = String(ctx.chat.id)
       if (!allow(cid)) return ctx.reply("⛔ Not allowed.")
       return ctx.reply(
-        "👋 Welcome to opencode!\n\nSend a message to start.\n\n/new — New session\n/abort — Stop\n/share — Link\n/help — Help",
+        "👋 Welcome to opencode!\n\nSend a message to start a coding session.\n\n" +
+        "/new — New session\n/abort — Stop task\n/share — Link\n/help — Help",
       )
     })
 
-    bot.help(async (ctx: any) => ctx.reply("/start · /new · /abort · /share · /help"))
+    bot.help(async (ctx: any) =>
+      ctx.reply(
+        "/start — Welcome\n/new — New session\n/abort — Stop task\n/share — Session link\n/help — This message\n\n" +
+        "Type any message to send a prompt to opencode.",
+      ),
+    )
 
     bot.command("new", async (ctx: any) => {
       const cid = String(ctx.chat.id)
@@ -117,7 +127,7 @@ export const TelegramCommand = effectCmd({
       if (!session) return ctx.reply("No active session.")
       const res = await client.session.abort({ path: { id: session.sessionId } })
       if (res.error) return ctx.reply(`Abort failed: ${res.error.data?.message}`)
-      return ctx.reply("⏹️ Aborted.")
+      return ctx.reply("⏹️ Session aborted.")
     })
 
     bot.command("status", async (ctx: any) => {
@@ -136,9 +146,36 @@ export const TelegramCommand = effectCmd({
       return ctx.reply("Failed to get share link.")
     })
 
+    // ── Handle inline keyboard callbacks (permission buttons) ──────
+
+    bot.on("callback_query", async (ctx: any) => {
+      await ctx.answerCallbackQuery()
+      const data = ctx.update.callback_query.data
+      if (!data.startsWith("perm:")) return
+
+      // Parse: perm:<permissionID>:<action>
+      const parts = data.split(":")
+      if (parts.length !== 3) return
+      const permissionID = parts[1]
+      const action = parts[2] // "allow" or "deny"
+
+      const cid = String(ctx.message.chat.id)
+      const session = sessions.get(cid)
+      if (!session) return
+
+      // Use the permission endpoint to respond
+      await client.postSessionIdPermissionsPermissionId({
+        path: { id: session.sessionId, permissionID },
+        body: { response: action },
+      })
+
+      await reply(cid, `✅ Permission ${action}ed.`)
+    })
+
     // ── Text messages ─────────────────────────────────────────────
 
-    bot.on("text", async (ctx: any) => {
+    bot.on("message", async (ctx: any) => {
+      if (!ctx.message?.text || ctx.message.text.startsWith("/") || ctx.message.caption) return
       const cid = String(ctx.chat.id)
       if (!allow(cid)) return ctx.reply("⛔ Not allowed.")
       if (ctx.message.text.startsWith("/")) return
@@ -152,9 +189,11 @@ export const TelegramCommand = effectCmd({
         if (!session) return
       }
 
-      try { await ctx.telegram.sendChatAction(cid, "typing") } catch {}
+      // Track user prompt to avoid echoing it back
+      session.userPrompt = ctx.message.text
 
-      const result = await client.session.prompt({
+      // Use promptAsync (non-blocking) — responses come via event stream
+      const result = await client.session.promptAsync({
         path: { id: session.sessionId },
         body: { parts: [{ type: "text", text: ctx.message.text }] },
       })
@@ -164,30 +203,44 @@ export const TelegramCommand = effectCmd({
       }
     })
 
-    // ── Helpers ───────────────────────────────────────────────────
-
-    async function send(cid: string, msg: string) {
-      await (bot.telegram.sendMessage(cid, trunc(msg, 4000)).catch(() => {}))
-    }
-
     // ── Event stream ──────────────────────────────────────────────
 
     (async () => {
       try {
         const events = await client.event.subscribe()
         for await (const ev of events.stream) {
+          // Session status — reset tracking state
           if (ev.type === "session.status") {
-            const status = ev.properties.status as string | undefined
+            const status = (ev.properties as any).status
             if (status === "idle" || status === "done") {
               const cid = chatOf(ev.properties.sessionID)
               if (cid) {
                 const s = sessions.get(cid)
-                if (s) { s.lastSent = null; s.lastReasoning = null }
+                if (s) { s.lastSent = null; s.lastReasoning = null; s.userPrompt = null }
               }
             }
             continue
           }
 
+          // Permission requested — show Allow/Deny buttons
+          if (ev.type === "permission.updated") {
+            const perm = ev.properties as { id: string; sessionID: string; title: string; type: string; pattern?: string | string[] }
+            const cid = chatOf(perm.sessionID)
+            if (!cid) continue
+
+            const pattern = Array.isArray(perm.pattern) ? perm.pattern.join(", ") : (perm.pattern ?? "")
+            const shortPattern = trunc(pattern, 200)
+
+            const msg = `🔒 Permission: ${perm.type}\n${perm.title}${shortPattern ? "\n" + shortPattern : ""}`
+            const btns = Markup.inlineKeyboard([
+              [Markup.button.callback("✅ Allow", `perm:${perm.id}:allow`)],
+              [Markup.button.callback("❌ Deny", `perm:${perm.id}:deny`)],
+            ])
+            await reply(cid, msg, btns)
+            continue
+          }
+
+          // Message part updates
           if (ev.type !== "message.part.updated") continue
           const part = ev.properties.part
           const cid = chatOf(part.sessionID as string)
@@ -198,6 +251,20 @@ export const TelegramCommand = effectCmd({
           if (part.type === "text") {
             const p = part as { text: string }
             if (s.lastSent === p.text) continue
+            // Skip user's own prompt (first text part is often echoed by the model)
+            if (s.userPrompt && p.text === s.userPrompt) {
+              s.userPrompt = null
+              continue
+            }
+            if (s.userPrompt && p.text.startsWith(s.userPrompt)) {
+              const rest = p.text.slice(s.userPrompt.length)
+              s.userPrompt = null
+              if (rest.trim()) {
+                s.lastSent = rest
+                send(cid, rest)
+              }
+              continue
+            }
             s.lastSent = p.text
             send(cid, p.text)
           } else if (part.type === "reasoning") {
@@ -218,8 +285,9 @@ export const TelegramCommand = effectCmd({
 
     // ── Launch ────────────────────────────────────────────────────
 
-    const info = yield* Effect.promise(() => bot.launch())
-    UI.println(UI.Style.TEXT_INFO_BOLD + "  Telegram:     ", UI.Style.TEXT_NORMAL, `@${info.bot.username}`)
+    yield* Effect.promise(() => bot.launch())
+    const username = yield* Effect.promise(async () => (await bot.telegram.getMe()).username)
+    UI.println(UI.Style.TEXT_INFO_BOLD + "  Telegram:     ", UI.Style.TEXT_NORMAL, `@${username}`)
     if (allowedUsers.length > 0) {
       UI.println(UI.Style.TEXT_INFO_BOLD + "  Allowed:      ", UI.Style.TEXT_NORMAL, allowedUsers.join(", "))
     }
