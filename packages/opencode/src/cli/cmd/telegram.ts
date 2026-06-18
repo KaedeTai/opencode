@@ -27,7 +27,7 @@ export const TelegramCommand = effectCmd({
       })
       .option("allowed-users", {
         type: "string",
-        describe: "comma-separated list of allowed chat IDs (empty = allow all)",
+        describe: "comma-separated list of allowed chat IDs (or set TELEGRAM_ALLOWED_USERS, empty = allow all)",
       }),
   handler: Effect.fn("Cli.telegram")(function* (rawArgs) {
     const args = rawArgs as TelegramArgs
@@ -42,7 +42,7 @@ export const TelegramCommand = effectCmd({
       )
     }
 
-    const allowedUsers = (args.allowedUsers ?? "").split(",").map((s) => s.trim()).filter(Boolean)
+    const allowedUsers = (args.allowedUsers ?? process.env.TELEGRAM_ALLOWED_USERS ?? "").split(",").map((s: string) => s.trim()).filter(Boolean)
 
     // ── Start server ──────────────────────────────────────────────
     const { Server } = yield* Effect.promise(() => import("../../server/server"))

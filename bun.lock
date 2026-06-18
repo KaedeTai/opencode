@@ -794,19 +794,6 @@
         "vite": "catalog:",
       },
     },
-    "packages/telegram": {
-      "name": "@opencode-ai/telegram",
-      "version": "1.0.0",
-      "dependencies": {
-        "@opencode-ai/sdk": "workspace:*",
-        "telegraf": "^4.16.3",
-      },
-      "devDependencies": {
-        "@types/node": "catalog:",
-        "@typescript/native-preview": "catalog:",
-        "typescript": "catalog:",
-      },
-    },
     "packages/tui": {
       "name": "@opencode-ai/tui",
       "version": "1.17.8",
@@ -1843,8 +1830,6 @@
     "@opencode-ai/stats-server": ["@opencode-ai/stats-server@workspace:packages/stats/server"],
 
     "@opencode-ai/storybook": ["@opencode-ai/storybook@workspace:packages/storybook"],
-
-    "@opencode-ai/telegram": ["@opencode-ai/telegram@workspace:packages/telegram"],
 
     "@opencode-ai/tui": ["@opencode-ai/tui@workspace:packages/tui"],
 
