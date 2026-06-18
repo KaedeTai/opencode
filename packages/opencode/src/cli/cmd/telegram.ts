@@ -63,14 +63,14 @@ export const TelegramCommand = effectCmd({
     const bot = new Telegraf(token)
 
     // ── Session map ───────────────────────────────────────────────
-    const sessions = new Map<string, { sessionId: string; lastSent: string | null }>()
+    const sessions = new Map<string, { sessionId: string; lastSent: string | null; lastReasoning: string | null }>()
 
     // ── Helpers ───────────────────────────────────────────────────
     async function createSession(chatId: string) {
       const res = await client.session.create({ body: { title: `Telegram ${chatId}` } })
       if (res.error) return null
       const sessionId = res.data.id
-      sessions.set(chatId, { sessionId, lastSent: null })
+      sessions.set(chatId, { sessionId, lastSent: null, lastReasoning: null })
       return sessionId
     }
 
@@ -169,6 +169,22 @@ export const TelegramCommand = effectCmd({
     void (async () => {
       const events = await client.event.subscribe()
       for await (const ev of events.stream) {
+        // session.status: reset track when session becomes idle
+        if (ev.type === "session.status") {
+          const status = ev.properties.status as string | undefined
+          if (status === "idle" || status === "done") {
+            const cid = chatOf(ev.properties.sessionID)
+            if (cid) {
+              const s = sessions.get(cid)
+              if (s) {
+                s.lastSent = null
+                s.lastReasoning = null
+              }
+            }
+          }
+          continue
+        }
+
         if (ev.type !== "message.part.updated") continue
         const part = ev.properties.part
 
@@ -182,9 +198,26 @@ export const TelegramCommand = effectCmd({
           s.lastSent = p.text
           const msg = trunc(p.text, 4000)
           try {
-            await bot.telegram.sendMessage(cid, msg, { parse_mode: "HTML" })
+            await bot.telegram.sendMessage(cid, msg).catch(() => {})
           } catch {
             await bot.telegram.sendMessage(cid, msg).catch(() => {})
+          }
+        }
+
+        if (part.type === "reasoning") {
+          const p = part as { sessionID: string; text: string }
+          const cid = chatOf(p.sessionID)
+          if (!cid) continue
+          const s = sessions.get(cid)
+          if (!s) continue
+          if (s.lastReasoning === p.text) continue
+          s.lastReasoning = p.text
+          const msg = trunc(`🧠 *Thinking*\n\n${p.text}`, Math.min(4000, p.text.length + 15))
+          try {
+            await bot.telegram.sendMessage(cid, msg, { parse_mode: "MarkdownV2" }).catch(() =>
+              bot.telegram.sendMessage(cid, trunc(`🧠 Thinking:\n\n${p.text}`, 4000)))
+          } catch {
+            await bot.telegram.sendMessage(cid, trunc(p.text, 4000)).catch(() => {})
           }
         }
 
