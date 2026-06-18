@@ -104,6 +104,7 @@ export const TelegramCommand = effectCmd({
     }
 
     async function send(cid: string, msg: string) {
+      if (!msg || !msg.trim()) return
       try {
         await bot.telegram.sendMessage(cid, trunc(msg, 4000))
       } catch (e: any) {
@@ -266,8 +267,10 @@ export const TelegramCommand = effectCmd({
       while (true) {
         try {
           const events = await client.event.subscribe()
+          console.error("[telegram] event stream connected")
           for await (const ev of events.stream) {
             try {
+              console.error("[telegram] event:", ev.type)
               // Session status — reset tracking state
               if (ev.type === "session.status") {
                 const status = (ev.properties as any).status
