@@ -188,25 +188,42 @@ export const TelegramCommand = effectCmd({
 
     void bot.on("callback_query", async (ctx: any) => {
       await safe(async () => {
+        console.error("[telegram] callback_query received, data:", ctx.update.callback_query.data)
         await ctx.answerCallbackQuery()
         const data = ctx.update.callback_query.data
         if (!data.startsWith("perm:")) return
 
         // Parse: perm:<permissionID>:<action>
         const parts = data.split(":")
-        if (parts.length !== 3) return
+        if (parts.length !== 3) {
+          console.error("[telegram] callback_query: invalid data format:", data)
+          return
+        }
         const permissionID = parts[1]
         const action = parts[2] // "allow" or "deny"
 
-        const cid = String(ctx.message.chat.id)
-        const session = sessions.get(cid)
-        if (!session) return
+        // callback_query.message is the message with the inline keyboard
+        const msg = ctx.update.callback_query.message
+        if (!msg) {
+          console.error("[telegram] callback_query: no message on callback query")
+          return
+        }
+        const cid = String(msg.chat.id)
+        console.error("[telegram] callback_query: cid=", cid, "action=", action, "permID=", permissionID)
 
+        const session = sessions.get(cid)
+        if (!session) {
+          console.error("[telegram] callback_query: no session for cid", cid)
+          return
+        }
+
+        console.error("[telegram] callback_query: calling API with sessionId=", session.sessionId)
         // Use the permission endpoint to respond
-        await client.postSessionIdPermissionsPermissionId({
+        const res = await client.postSessionIdPermissionsPermissionId({
           path: { id: session.sessionId, permissionID },
           body: { response: action },
         })
+        console.error("[telegram] callback_query: API response:", JSON.stringify(res))
 
         await reply(cid, `✅ Permission ${action}ed.`)
       }, "bot.on(callback_query)")
@@ -342,25 +359,21 @@ export const TelegramCommand = effectCmd({
       { command: "help", description: "Show all commands" },
     ]))
 
-    // ── Launch ────────────────────────────────────────────────────
+    // ── Launch (fire-and-forget, launch() keeps polling running forever) ──
 
-    try {
-      yield* Effect.promise(() => bot.launch())
-    } catch(_e: any) {
-      console.error("[telegram] bot.launch() failed:", _e?.message ?? _e)
-      // Don't return — let the process stay alive so we can see errors
+    bot.launch().then(() => {
+      console.error("[telegram] bot.launch() unexpectedly resolved")
+    }).catch((err: any) => {
+      console.error("[telegram] bot.launch() error:", err?.message ?? err)
+    })
+    const username = yield* Effect.promise(() => bot.telegram.getMe().then(r => r.username))
+    UI.println(UI.Style.TEXT_INFO_BOLD + "  Telegram:     ", UI.Style.TEXT_NORMAL, `@${username}`)
+    if (allowedUsers.length > 0) {
+      UI.println(UI.Style.TEXT_INFO_BOLD + "  Allowed:      ", UI.Style.TEXT_NORMAL, allowedUsers.join(", "))
     }
-    try {
-      const username = yield* Effect.promise(async () => (await bot.telegram.getMe()).username)
-      UI.println(UI.Style.TEXT_INFO_BOLD + "  Telegram:     ", UI.Style.TEXT_NORMAL, `@${username}`)
-      if (allowedUsers.length > 0) {
-        UI.println(UI.Style.TEXT_INFO_BOLD + "  Allowed:      ", UI.Style.TEXT_NORMAL, allowedUsers.join(", "))
-      }
-      UI.empty()
-    } catch (_e: any) {
-      console.error("[telegram] getMe failed:", _e?.message ?? _e)
-    }
+    UI.empty()
 
+    // Keep process alive — bot polling runs in background
     yield* Effect.never
   }),
 })
