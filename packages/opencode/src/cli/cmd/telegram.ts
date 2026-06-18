@@ -282,7 +282,7 @@ export const TelegramCommand = effectCmd({
               }
 
               // Permission requested — show Allow/Deny buttons
-              if (ev.type === "permission.updated") {
+              if (ev.type === "permission.asked") {
                 const perm = ev.properties as { id: string; sessionID: string; title: string; type: string; pattern?: string | string[] }
                 const cid = chatOf(perm.sessionID)
                 if (!cid) continue
