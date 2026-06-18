@@ -202,6 +202,7 @@ export const TelegramCommand = effectCmd({
             send(cid, p.text)
           } else if (part.type === "reasoning") {
             const p = part as { text: string }
+            if (!p.text || !p.text.trim()) continue
             if (s.lastReasoning === p.text) continue
             s.lastReasoning = p.text
             send(cid, `🧠 Thinking:\n\n${p.text}`)
