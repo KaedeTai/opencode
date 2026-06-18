@@ -164,71 +164,55 @@ export const TelegramCommand = effectCmd({
       }
     })
 
+    // ── Helpers ───────────────────────────────────────────────────
+
+    async function send(cid: string, msg: string) {
+      await (bot.telegram.sendMessage(cid, trunc(msg, 4000)).catch(() => {}))
+    }
+
     // ── Event stream ──────────────────────────────────────────────
 
-    void (async () => {
-      const events = await client.event.subscribe()
-      for await (const ev of events.stream) {
-        // session.status: reset track when session becomes idle
-        if (ev.type === "session.status") {
-          const status = ev.properties.status as string | undefined
-          if (status === "idle" || status === "done") {
-            const cid = chatOf(ev.properties.sessionID)
-            if (cid) {
-              const s = sessions.get(cid)
-              if (s) {
-                s.lastSent = null
-                s.lastReasoning = null
+    (async () => {
+      try {
+        const events = await client.event.subscribe()
+        for await (const ev of events.stream) {
+          if (ev.type === "session.status") {
+            const status = ev.properties.status as string | undefined
+            if (status === "idle" || status === "done") {
+              const cid = chatOf(ev.properties.sessionID)
+              if (cid) {
+                const s = sessions.get(cid)
+                if (s) { s.lastSent = null; s.lastReasoning = null }
               }
             }
+            continue
           }
-          continue
-        }
 
-        if (ev.type !== "message.part.updated") continue
-        const part = ev.properties.part
-
-        if (part.type === "text") {
-          const p = part as { sessionID: string; text: string }
-          const cid = chatOf(p.sessionID)
+          if (ev.type !== "message.part.updated") continue
+          const part = ev.properties.part
+          const cid = chatOf(part.sessionID as string)
           if (!cid) continue
           const s = sessions.get(cid)
           if (!s) continue
-          if (s.lastSent === p.text) continue
-          s.lastSent = p.text
-          const msg = trunc(p.text, 4000)
-          try {
-            await bot.telegram.sendMessage(cid, msg).catch(() => {})
-          } catch {
-            await bot.telegram.sendMessage(cid, msg).catch(() => {})
+
+          if (part.type === "text") {
+            const p = part as { text: string }
+            if (s.lastSent === p.text) continue
+            s.lastSent = p.text
+            send(cid, p.text)
+          } else if (part.type === "reasoning") {
+            const p = part as { text: string }
+            if (s.lastReasoning === p.text) continue
+            s.lastReasoning = p.text
+            send(cid, `🧠 Thinking:\n\n${p.text}`)
+          } else if (part.type === "tool") {
+            const p = part as { tool: string; state: { status: string; title?: string } }
+            if (p.state.status === "completed" && p.state.title) {
+              send(cid, `🔧 ${p.tool}: ${p.state.title}`)
+            }
           }
         }
-
-        if (part.type === "reasoning") {
-          const p = part as { sessionID: string; text: string }
-          const cid = chatOf(p.sessionID)
-          if (!cid) continue
-          const s = sessions.get(cid)
-          if (!s) continue
-          if (s.lastReasoning === p.text) continue
-          s.lastReasoning = p.text
-          const msg = trunc(`🧠 *Thinking*\n\n${p.text}`, Math.min(4000, p.text.length + 15))
-          try {
-            await bot.telegram.sendMessage(cid, msg, { parse_mode: "MarkdownV2" }).catch(() =>
-              bot.telegram.sendMessage(cid, trunc(`🧠 Thinking:\n\n${p.text}`, 4000)))
-          } catch {
-            await bot.telegram.sendMessage(cid, trunc(p.text, 4000)).catch(() => {})
-          }
-        }
-
-        if (part.type === "tool") {
-          const p = part as { sessionID: string; tool: string; state: { status: string; title?: string } }
-          if (p.state.status !== "completed" || !p.state.title) continue
-          const cid = chatOf(p.sessionID)
-          if (!cid) continue
-          await bot.telegram.sendMessage(cid, trunc(`🔧 ${p.tool}: ${p.state.title}`, 2000)).catch(() => {})
-        }
-      }
+      } catch (_e) {}
     })()
 
     // ── Launch ────────────────────────────────────────────────────
