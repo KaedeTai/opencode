@@ -1,6 +1,6 @@
 import { Effect } from "effect"
 import { UI } from "../ui"
-import { effectCmd, fail, CliError } from "../effect-cmd"
+import { effectCmd, fail } from "../effect-cmd"
 import { withNetworkOptions, resolveNetworkOptions } from "../network"
 import type { NetworkOptions } from "../network"
 
@@ -27,6 +27,7 @@ export const TelegramCommand = effectCmd({
       }),
   handler: Effect.fn("Cli.telegram")(function* (rawArgs) {
     const args = rawArgs as TelegramArgs
+    console.error("[telegram] handler start")
 
     // ── Resolve bot token ──────────────────────────────────────────
     const token = args.token ?? process.env.TELEGRAM_BOT_TOKEN
@@ -37,13 +38,19 @@ export const TelegramCommand = effectCmd({
           "  Get one from: https://t.me/BotFather",
       )
     }
+    console.error("[telegram] token resolved")
 
     const allowedUsers = (args.allowedUsers ?? process.env.TELEGRAM_ALLOWED_USERS ?? "").split(",").map((s: string) => s.trim()).filter(Boolean)
+    console.error("[telegram] allowedUsers:", allowedUsers)
 
     // ── Start server ──────────────────────────────────────────────
+    console.error("[telegram] importing server...")
     const { Server } = yield* Effect.promise(() => import("../../server/server"))
+    console.error("[telegram] resolving network options...")
     const opts = yield* resolveNetworkOptions(args)
+    console.error("[telegram] starting server...")
     const server = yield* Effect.promise(() => Server.listen(opts))
+    console.error("[telegram] server started at", server.url.toString())
 
     UI.empty()
     UI.println(UI.logo("  "))
@@ -51,14 +58,19 @@ export const TelegramCommand = effectCmd({
     UI.println(UI.Style.TEXT_INFO_BOLD + "  Server:       ", UI.Style.TEXT_NORMAL, server.url.toString())
 
     // ── SDK client ────────────────────────────────────────────────
+    console.error("[telegram] creating SDK client...")
     const { createOpencodeClient } = yield* Effect.promise(() => import("@opencode-ai/sdk"))
     const client = createOpencodeClient({ baseUrl: server.url.toString() })
+    console.error("[telegram] SDK client created")
 
     // ── Telegraf bot ──────────────────────────────────────────────
+    console.error("[telegram] importing Telegraf...")
     const { Telegraf, Markup } = yield* Effect.promise(() => import("telegraf"))
+    console.error("[telegram] Telegraf imported, creating bot...")
     const bot = new Telegraf(token) as any
+    console.error("[telegram] bot created")
 
-    // ── Global error handler — NEVER let unhandled errors kill the process ──
+    // ── Global error handler ──────────────────────────────────────
     bot.catch((err: any, ctx: any) => {
       console.error("[telegram] unhandled error:", err?.message ?? err, "ctx:", ctx?.updateType ?? "unknown")
     })
@@ -67,12 +79,8 @@ export const TelegramCommand = effectCmd({
     const sessions = new Map<string, { sessionId: string; lastSent: string | null; lastReasoning: string | null; userPrompt: string | null }>()
 
     // ── Helpers ───────────────────────────────────────────────────
-    async function safe(fn: () => Promise<void>, label: string) {
-      try {
-        await fn()
-      } catch (e: any) {
-        console.error(`[telegram] ${label}:`, e?.message ?? e)
-      }
+    function safe(fn: () => Promise<void>, label: string) {
+      fn().catch((e: any) => console.error(`[telegram] ${label}:`, e?.message ?? e))
     }
 
     async function createSession(chatId: string) {
@@ -120,158 +128,69 @@ export const TelegramCommand = effectCmd({
       }
     }
 
-    // ── Commands ──────────────────────────────────────────────────
-
-    void bot.start(async (ctx: any) => {
-      await safe(async () => {
-        const cid = String(ctx.chat.id)
-        if (!allow(cid)) return ctx.reply("⛔ Not allowed.")
-        return ctx.reply(
-          "👋 Welcome to opencode!\n\nSend a message to start a coding session.\n\n" +
-          "/new — New session\n/abort — Stop task\n/share — Link\n/help — Help",
-        )
-      }, "bot.start")
-    })
-
-    void bot.help(async (ctx: any) => {
-      await safe(async () => {
-        return ctx.reply(
-          "/start — Welcome\n/new — New session\n/abort — Stop task\n/share — Session link\n/help — This message\n\n" +
-          "Type any message to send a prompt to opencode.",
-        )
-      }, "bot.help")
-    })
-
-    void bot.command("new", async (ctx: any) => {
-      await safe(async () => {
-        const cid = String(ctx.chat.id)
-        if (!allow(cid)) return ctx.reply("⛔ Not allowed.")
-        const sid = await createSession(cid)
-        if (!sid) return ctx.reply("Failed to create session.")
-        const share = await client.session.share({ path: { id: sid } })
-        const link = !share.error && share.data?.share?.url ? `\n${share.data.share.url}` : ""
-        return ctx.reply(`✅ New session: ${sid}${link}`)
-      }, "bot.command(new)")
-    })
-
-    void bot.command("abort", async (ctx: any) => {
-      await safe(async () => {
-        const cid = String(ctx.chat.id)
-        const session = sessions.get(cid)
-        if (!session) return ctx.reply("No active session.")
-        const res = await client.session.abort({ path: { id: session.sessionId } })
-        if (res.error) return ctx.reply(`Abort failed: ${res.error.data?.message}`)
-        return ctx.reply("⏹️ Session aborted.")
-      }, "bot.command(abort)")
-    })
-
-    void bot.command("status", async (ctx: any) => {
-      await safe(async () => {
-        const cid = String(ctx.chat.id)
-        const session = sessions.get(cid)
-        if (!session) return ctx.reply("No active session.")
-        return ctx.reply(`Session: <code>${session.sessionId}</code>`, { parse_mode: "HTML" })
-      }, "bot.command(status)")
-    })
-
-    void bot.command("share", async (ctx: any) => {
-      await safe(async () => {
-        const cid = String(ctx.chat.id)
-        const session = sessions.get(cid)
-        if (!session) return ctx.reply("No active session.")
-        const res = await client.session.share({ path: { id: session.sessionId } })
-        if (!res.error && res.data?.share?.url) return ctx.reply(res.data.share.url)
-        return ctx.reply("Failed to get share link.")
-      }, "bot.command(share)")
-    })
-
-    // ── Handle inline keyboard callbacks (permission buttons) ──────
-
-    void bot.on("callback_query", async (ctx: any) => {
-      await safe(async () => {
-        console.error("[telegram] callback_query received, data:", ctx.update.callback_query.data)
-        await ctx.answerCallbackQuery()
-        const data = ctx.update.callback_query.data
-        if (!data.startsWith("perm:")) return
-
-        // Parse: perm:<permissionID>:<action>
-        const parts = data.split(":")
-        if (parts.length !== 3) {
-          console.error("[telegram] callback_query: invalid data format:", data)
-          return
-        }
-        const permissionID = parts[1]
-        const action = parts[2] // "allow" or "deny"
-
-        // callback_query.message is the message with the inline keyboard
-        const msg = ctx.update.callback_query.message
-        if (!msg) {
-          console.error("[telegram] callback_query: no message on callback query")
-          return
-        }
-        const cid = String(msg.chat.id)
-        console.error("[telegram] callback_query: cid=", cid, "action=", action, "permID=", permissionID)
-
-        const session = sessions.get(cid)
-        if (!session) {
-          console.error("[telegram] callback_query: no session for cid", cid)
-          return
-        }
-
-        console.error("[telegram] callback_query: calling API with sessionId=", session.sessionId)
-        // Use the permission endpoint to respond
-        const res = await client.postSessionIdPermissionsPermissionId({
-          path: { id: session.sessionId, permissionID },
-          body: { response: action },
-        })
-        console.error("[telegram] callback_query: API response:", JSON.stringify(res))
-
-        await reply(cid, `✅ Permission ${action}ed.`)
-      }, "bot.on(callback_query)")
-    })
-
-    // ── Text messages ─────────────────────────────────────────────
-
-    void bot.on("message", async (ctx: any) => {
-      await safe(async () => {
-        if (!ctx.message?.text || ctx.message.text.startsWith("/") || ctx.message.caption) return
-        const cid = String(ctx.chat.id)
-        if (!allow(cid)) return ctx.reply("⛔ Not allowed.")
-
+    // ── Message handler ────────────────────────────────────────────
+    // NOTE: In Telegraf 4.x, bot.on() returns a new Telegraf instance, so we
+    // MUST capture the return value to keep registering on the same bot.
+    let b = bot
+    b = b.on("message", async (ctx: any) => {
+      console.error("[telegram] DEBUG: message event fired, text:", ctx.message?.text)
+      if (!ctx.message?.text || ctx.message.text.startsWith("/") || ctx.message.caption) return
+      const cid = String(ctx.chat.id)
+      if (!allow(cid)) return
+      safe(async () => {
         let session = sessions.get(cid)
         if (!session) {
           const sid = await createSession(cid)
-          if (!sid) return ctx.reply("Failed to create session.")
+          if (!sid) { await ctx.reply("Failed to create session."); return }
           session = sessions.get(cid)
           if (!session) return
         }
-
-        // Track user prompt to avoid echoing it back
         session.userPrompt = ctx.message.text
-
-        // Use promptAsync (non-blocking) — responses come via event stream
         const result = await client.session.promptAsync({
           path: { id: session.sessionId },
           body: { parts: [{ type: "text", text: ctx.message.text }] },
         })
-
         if (result.error) {
           await ctx.reply(`Error: ${result.error.data?.message ?? "Failed"}`)
         }
-      }, "bot.on(message)")
+      }, "message handler")
+    })
+
+    // ── Callback query handler ────────────────────────────────────
+    b = b.on("callback_query", async (ctx: any) => {
+      console.error("[telegram] DEBUG: callback_query event fired")
+      await ctx.answerCallbackQuery().catch(() => {})
+      const data = ctx.callbackQuery?.data
+      if (!data || !data.startsWith("perm:")) return
+      const parts = data.split(":")
+      if (parts.length !== 3) return
+      const permissionID = parts[1]
+      const action = parts[2]
+      const msg = ctx.callbackQuery.message
+      if (!msg) return
+      const cid = String(msg.chat.id)
+      const session = sessions.get(cid)
+      if (!session) return
+      safe(async () => {
+        const res = await client.postSessionIdPermissionsPermissionId({
+          path: { id: session.sessionId, permissionID },
+          body: { response: action },
+        })
+        console.error("[telegram] permission response:", JSON.stringify(res))
+        await reply(cid, `✅ Permission ${action}ed.`)
+      }, "callback_query handler")
     })
 
     // ── Event stream ──────────────────────────────────────────────
-
+    console.error("[telegram] starting event stream loop...")
     ;(async () => {
       while (true) {
         try {
           const events = await client.event.subscribe()
-          console.error("[telegram] event stream connected")
+          console.error("[telegram] event stream connected, waiting...")
           for await (const ev of events.stream) {
             try {
               console.error("[telegram] event:", ev.type)
-              // Session status — reset tracking state
               if (ev.type === "session.status") {
                 const status = (ev.properties as any).status
                 if (status === "idle" || status === "done") {
@@ -313,7 +232,6 @@ export const TelegramCommand = effectCmd({
               if (part.type === "text") {
                 const p = part as { text: string }
                 if (s.lastSent === p.text) continue
-                // Skip user's own prompt (first text part is often echoed by the model)
                 if (s.userPrompt && p.text === s.userPrompt) {
                   s.userPrompt = null
                   continue
@@ -351,31 +269,41 @@ export const TelegramCommand = effectCmd({
         }
       }
     })()
+    console.error("[telegram] event stream started")
 
     // ── Register bot commands so Telegram shows the command menu ──────────
-    yield* Effect.promise(() => bot.telegram.setMyCommands([
+    console.error("[telegram] setting bot commands...")
+    bot.telegram.setMyCommands([
       { command: "start", description: "Welcome message" },
       { command: "new", description: "Create a new session" },
       { command: "abort", description: "Stop current task" },
       { command: "status", description: "Show current session" },
       { command: "share", description: "Get share link" },
       { command: "help", description: "Show all commands" },
-    ]))
+    ]).then(() => console.error("[telegram] setMyCommands done")).catch((e: any) => console.error("[telegram] setMyCommands error:", e?.message ?? e))
 
-    // ── Launch (fire-and-forget, launch() keeps polling running forever) ──
-
+    // ── Launch ─────────────────────────────────────────────────────
+    console.error("[telegram] launching bot...")
     bot.launch().then(() => {
       console.error("[telegram] bot.launch() unexpectedly resolved")
     }).catch((err: any) => {
       console.error("[telegram] bot.launch() error:", err?.message ?? err)
     })
-    const username = yield* Effect.promise(() => bot.telegram.getMe().then(r => r.username))
-    UI.println(UI.Style.TEXT_INFO_BOLD + "  Telegram:     ", UI.Style.TEXT_NORMAL, `@${username}`)
+    console.error("[telegram] calling getMe...")
+    bot.telegram.getMe().then((me: any) => {
+      console.error("[telegram] getMe SUCCESS:", me.username)
+      UI.println(UI.Style.TEXT_INFO_BOLD + "  Telegram:     ", UI.Style.TEXT_NORMAL, `@${me.username}`)
+    }).catch((e: any) => {
+      console.error("[telegram] getMe error:", e?.message ?? e)
+      UI.println(UI.Style.TEXT_INFO_BOLD + "  Telegram:     ", UI.Style.TEXT_NORMAL, "(unverified)")
+    })
+
     if (allowedUsers.length > 0) {
       UI.println(UI.Style.TEXT_INFO_BOLD + "  Allowed:      ", UI.Style.TEXT_NORMAL, allowedUsers.join(", "))
     }
     UI.empty()
 
+    console.error("[telegram] entering Effect.never...")
     // Keep process alive — bot polling runs in background
     yield* Effect.never
   }),
