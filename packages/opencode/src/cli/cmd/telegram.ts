@@ -3,6 +3,8 @@ import { UI } from "../ui"
 import { effectCmd, fail } from "../effect-cmd"
 import { withNetworkOptions, resolveNetworkOptions } from "../network"
 import type { NetworkOptions } from "../network"
+import path from "path"
+import { Global } from "@opencode-ai/core/global"
 
 type TelegramArgs = NetworkOptions & {
   token?: string
@@ -75,9 +77,6 @@ export const TelegramCommand = effectCmd({
       console.error("[telegram] unhandled error:", err?.message ?? err, "ctx:", ctx?.updateType ?? "unknown")
     })
 
-    // ── Session map ───────────────────────────────────────────────
-    const sessions = new Map<string, { sessionId: string; lastSent: string | null; lastReasoning: string | null; userPrompt: string | null }>()
-
     // ── Helpers ───────────────────────────────────────────────────
     function safe(fn: () => Promise<void>, label: string) {
       fn().catch((e: any) => console.error(`[telegram] ${label}:`, e?.message ?? e))
@@ -89,6 +88,7 @@ export const TelegramCommand = effectCmd({
         if (res.error) return null
         const sessionId = res.data.id
         sessions.set(chatId, { sessionId, lastSent: null, lastReasoning: null, userPrompt: null })
+        persistSessions()
         return sessionId
       } catch (e: any) {
         console.error("[telegram] createSession error:", e?.message ?? e)
@@ -128,15 +128,59 @@ export const TelegramCommand = effectCmd({
       }
     }
 
+    // ── Session map (with JSON persistence) ───────────────────────
+    const SESSIONS_FILE = path.join(Global.Path.data, "telegram-sessions.json")
+    const sessions = new Map<string, { sessionId: string; lastSent: string | null; lastReasoning: string | null; userPrompt: string | null }>()
+
+    // Load existing sessions on startup (only if file exists)
+    const sessionsFileExists = yield* Effect.promise(() => Bun.file(SESSIONS_FILE).exists())
+    if (sessionsFileExists) {
+      try {
+        const data = yield* Effect.promise(() => Bun.file(SESSIONS_FILE).json())
+        for (const [cid, sess] of Object.entries(data as Record<string, any>)) {
+          sessions.set(cid, sess)
+        }
+        console.error("[telegram] loaded", sessions.size, "persisted sessions")
+      } catch (e: any) {
+        console.error("[telegram] failed to load sessions:", e?.message ?? e)
+      }
+    } else {
+      console.error("[telegram] no persisted sessions file, starting fresh")
+    }
+
+    // Persist sessions to disk (debounced)
+    let persistTimer: ReturnType<typeof setTimeout> | null = null
+    function persistSessions() {
+      if (persistTimer) clearTimeout(persistTimer)
+      persistTimer = setTimeout(async () => {
+        try {
+          await Bun.write(SESSIONS_FILE, JSON.stringify(Object.fromEntries(sessions), null, 2))
+        } catch (e: any) {
+          console.error("[telegram] failed to persist sessions:", e?.message ?? e)
+        }
+      }, 500)
+    }
+
     // ── Message handler ────────────────────────────────────────────
-    // NOTE: In Telegraf 4.x, bot.on() returns a new Telegraf instance, so we
-    // MUST capture the return value to keep registering on the same bot.
-    let b = bot
-    b = b.on("message", async (ctx: any) => {
+    bot.on("message", async (ctx: any) => {
       const text = ctx.message?.text ?? ctx.message?.caption ?? ""
       const cid = String(ctx.chat.id)
+      console.error("[telegram] message from", cid, "type:", ctx.chat.type, ":", JSON.stringify(text.slice(0, 80)))
       if (!text) return
-      if (!allow(cid)) return
+      if (!allow(cid)) {
+        console.error("[telegram] chat", cid, "not in allowlist, ignoring")
+        return
+      }
+      // In group chats, only respond when @-mentioned or to commands
+      if (ctx.chat.type !== "private") {
+        const me = await ctx.telegram.getMe().catch(() => null)
+        const username = me?.username ? `@${me.username}` : ""
+        const isCommand = text.startsWith("/")
+        if (!isCommand && username && !text.includes(username)) {
+          console.error("[telegram] group message without mention, ignoring")
+          return
+        }
+      }
 
       // ── Commands ──────────────────────────────────────────────────
       if (text.startsWith("/")) {
@@ -176,7 +220,11 @@ export const TelegramCommand = effectCmd({
           return
         }
         if (cmd === "help") {
-          await ctx.reply("Commands:\n/new - create session\n/abort - stop task\n/status - show session\n/share - get share link\n/help - show this\n\nOr just send any request!")
+          await ctx.reply("Commands:\n/new - create session\n/abort - stop task\n/status - show session\n/share - get share link\n/whoami - show your chat ID\n/help - show this\n\nOr just send any request!")
+          return
+        }
+        if (cmd === "whoami") {
+          await ctx.reply(`Your chat ID: \`${cid}\``, { parse_mode: "Markdown" })
           return
         }
         // Unknown command — fall through to prompt
@@ -204,7 +252,7 @@ export const TelegramCommand = effectCmd({
     })
 
     // ── Callback query handler ────────────────────────────────────
-    b = b.on("callback_query", async (ctx: any) => {
+    bot.on("callback_query", async (ctx: any) => {
       console.error("[telegram] DEBUG: callback_query event fired, data:", ctx.callbackQuery?.data)
       // Telegraf 4.x: answer via ctx.telegram.answerCallbackQuery
       if (ctx.telegram?.answerCallbackQuery) {
@@ -219,11 +267,15 @@ export const TelegramCommand = effectCmd({
       const parts = data.split(":")
       if (parts.length !== 3) return
       const permissionID = parts[1]
-      const action = parts[2] // "allow" or "deny" from button
-      const response = action === "deny" ? "reject" : "once"
+      const action = parts[2] // "allow" | "deny" | "always"
+      const response: "once" | "always" | "reject" = action === "deny" ? "reject" : action === "always" ? "always" : "once"
       const msg = ctx.callbackQuery.message
       if (!msg) return
       const cid = String(msg.chat.id)
+      if (!allow(cid)) {
+        console.error("[telegram] callback from non-allowlisted chat", cid, ", ignoring")
+        return
+      }
       const session = sessions.get(cid)
       if (!session) return
       safe(async () => {
@@ -235,7 +287,8 @@ export const TelegramCommand = effectCmd({
         if (res.error) {
           await reply(cid, `❌ Permission error: ${res.error.data?.message ?? "Unknown"}`)
         } else {
-          await reply(cid, `✅ Permission ${action === "deny" ? "denied" : "allowed"}.`)
+          const label = action === "deny" ? "denied" : action === "always" ? "always allowed" : "allowed"
+          await reply(cid, `✅ Permission ${label}.`)
         }
       }, "callback_query handler")
     })
@@ -252,9 +305,9 @@ export const TelegramCommand = effectCmd({
             try {
               console.error("[telegram] event:", ev.type)
               if (ev.type === "session.status") {
-                const status = (ev.properties as any).status
-                if (status === "idle" || status === "done") {
-                  const cid = chatOf(ev.properties.sessionID)
+                const props = ev.properties as { sessionID: string; status: { type: string } }
+                if (props.status?.type === "idle") {
+                  const cid = chatOf(props.sessionID)
                   if (cid) {
                     const s = sessions.get(cid)
                     if (s) { s.lastSent = null; s.lastReasoning = null; s.userPrompt = null }
@@ -265,9 +318,15 @@ export const TelegramCommand = effectCmd({
 
               // Permission requested — show Allow/Deny buttons
               const evType = ev.type as string
-              if (evType === "permission.v2.asked") {
-                const perm = ev.properties as { id: string; sessionID: string; action: string; resources: string[]; metadata?: Record<string, string> }
-                console.error("[telegram] permission.v2.asked:", JSON.stringify(perm))
+              if (evType === "permission.asked") {
+                const perm = ev.properties as {
+                  id: string
+                  sessionID: string
+                  permission: string
+                  patterns: string[]
+                  metadata?: Record<string, unknown>
+                }
+                console.error("[telegram] permission.asked:", JSON.stringify(perm))
                 const cid = chatOf(perm.sessionID)
                 if (!cid) {
                   console.error("[telegram] permission session not found in sessions map, sessionIDs:", [...sessions.values()].map(s => s.sessionId))
@@ -275,14 +334,15 @@ export const TelegramCommand = effectCmd({
                 }
                 console.error("[telegram] sending permission buttons to cid:", cid)
 
-                const pattern = perm.resources.join(", ")
+                const pattern = perm.patterns.join(", ")
                 const shortPattern = trunc(pattern, 200)
-                const meta = perm.metadata ?? {}
+                const meta = (perm.metadata ?? {}) as { filepath?: string; parentDir?: string }
                 const detail = meta.filepath ?? meta.parentDir ?? ""
 
-                const msg = `🔒 Permission: ${perm.action}${detail ? "\n" + detail : ""}${shortPattern ? "\n" + shortPattern : ""}`
+                const msg = `🔒 Permission: ${perm.permission}${detail ? "\n" + detail : ""}${shortPattern ? "\n" + shortPattern : ""}`
                 const btns = Markup.inlineKeyboard([
                   [Markup.button.callback("✅ Allow", `perm:${perm.id}:allow`)],
+                  [Markup.button.callback("✅ Always", `perm:${perm.id}:always`)],
                   [Markup.button.callback("❌ Deny", `perm:${perm.id}:deny`)],
                 ])
                 await reply(cid, msg, btns)
@@ -348,6 +408,7 @@ export const TelegramCommand = effectCmd({
       { command: "abort", description: "Stop current task" },
       { command: "status", description: "Show current session" },
       { command: "share", description: "Get share link" },
+      { command: "whoami", description: "Show your chat ID" },
       { command: "help", description: "Show all commands" },
     ]).then(() => console.error("[telegram] setMyCommands done")).catch((e: any) => console.error("[telegram] setMyCommands error:", e?.message ?? e))
 
