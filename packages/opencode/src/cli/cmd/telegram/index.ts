@@ -1,13 +1,13 @@
 import { Effect } from "effect"
-import { UI } from "../ui"
-import { effectCmd, fail } from "../effect-cmd"
-import { withNetworkOptions, resolveNetworkOptions } from "../network"
-import type { NetworkOptions } from "../network"
-import path from "path"
-import fs from "fs"
-import os from "os"
-import { Global } from "@opencode-ai/core/global"
-import { Database as BunDB } from "bun:sqlite"
+import { UI } from "../../ui"
+import { effectCmd, fail } from "../../effect-cmd"
+import { withNetworkOptions, resolveNetworkOptions } from "../../network"
+import type { NetworkOptions } from "../../network"
+import { getModelCatalog, getCurrentModel, setDefaultModel, resolveModel, getSessionTokens } from "./config"
+import { trunc } from "./format"
+import { log } from "./log"
+import { transcribeAudio } from "./whisper"
+import { getSessionsFile } from "./paths"
 
 type TelegramArgs = NetworkOptions & {
   token?: string
@@ -20,7 +20,7 @@ export const TelegramCommand = effectCmd({
   aliases: ["tg"],
   describe: "start opencode server with Telegram bot interface",
   instance: false,
-  builder: (yargs) =>
+  builder: (yargs: any) =>
     withNetworkOptions(yargs)
       .option("token", {
         type: "string",
@@ -31,8 +31,7 @@ export const TelegramCommand = effectCmd({
         describe: "comma-separated list of allowed chat IDs (or set TELEGRAM_ALLOWED_USERS, empty = allow all)",
       }),
   handler: Effect.fn("Cli.telegram")(function* (rawArgs) {
-    const args = rawArgs as TelegramArgs
-    console.error("[telegram] handler start")
+    const args = rawArgs as unknown as TelegramArgs
 
     // ── Resolve bot token ──────────────────────────────────────────
     const token = args.token ?? process.env.TELEGRAM_BOT_TOKEN
@@ -43,19 +42,16 @@ export const TelegramCommand = effectCmd({
           "  Get one from: https://t.me/BotFather",
       )
     }
-    console.error("[telegram] token resolved")
+    yield* Effect.logDebug("telegram token resolved")
 
     const allowedUsers = (args.allowedUsers ?? process.env.TELEGRAM_ALLOWED_USERS ?? "").split(",").map((s: string) => s.trim()).filter(Boolean)
-    console.error("[telegram] allowedUsers:", allowedUsers)
+    yield* Effect.logDebug("telegram allowedUsers set", { count: allowedUsers.length })
 
     // ── Start server ──────────────────────────────────────────────
-    console.error("[telegram] importing server...")
-    const { Server } = yield* Effect.promise(() => import("../../server/server"))
-    console.error("[telegram] resolving network options...")
+    const { Server } = yield* Effect.promise(() => import("../../../server/server"))
     const opts = yield* resolveNetworkOptions(args)
-    console.error("[telegram] starting server...")
     const server = yield* Effect.promise(() => Server.listen(opts))
-    console.error("[telegram] server started at", server.url.toString())
+    yield* Effect.logInfo("telegram server started", { url: server.url.toString() })
 
     UI.empty()
     UI.println(UI.logo("  "))
@@ -63,15 +59,12 @@ export const TelegramCommand = effectCmd({
     UI.println(UI.Style.TEXT_INFO_BOLD + "  Server:       ", UI.Style.TEXT_NORMAL, server.url.toString())
 
     // ── SDK client ────────────────────────────────────────────────
-    console.error("[telegram] creating SDK client...")
     const { createOpencodeClient } = yield* Effect.promise(() => import("@opencode-ai/sdk"))
     const client = createOpencodeClient({ baseUrl: server.url.toString() })
-    console.error("[telegram] SDK client created")
+    yield* Effect.logDebug("telegram SDK client created")
 
     // ── Telegraf bot ──────────────────────────────────────────────
-    console.error("[telegram] importing Telegraf...")
     const { Telegraf, Markup } = yield* Effect.promise(() => import("telegraf"))
-    console.error("[telegram] Telegraf imported, creating bot...")
     // handlerTimeout default in Telegraf is 90s. Our command handlers
     // do fire-and-forget dispatch via `safe()`, so a single command
     // should resolve within milliseconds. A 90s window is dangerous:
@@ -81,33 +74,33 @@ export const TelegramCommand = effectCmd({
     // message queues up behind the stuck one. 5s is plenty for our
     // handlers — anything slower than that almost certainly is the
     // Telegram API itself, which we don't want to block polling on.
-    const bot = new Telegraf(token, { handlerTimeout: 5_000 }) as any
-    console.error("[telegram] bot created")
+    const bot = new Telegraf(token, { handlerTimeout: 5_000 })
+    yield* Effect.logDebug("telegram bot created")
 
     // ── Global error handler ──────────────────────────────────────
-    bot.catch((err: any, ctx: any) => {
-      console.error("[telegram] unhandled error:", err?.message ?? err, "ctx:", ctx?.updateType ?? "unknown")
+    bot.catch((err: unknown, ctx: any) => {
+      const e = err as { message?: string }
+      log.error("unhandled error", { message: e?.message ?? String(err), updateType: ctx?.updateType })
     })
 
     // ── Helpers ───────────────────────────────────────────────────
     function safe(fn: () => Promise<void>, label: string) {
-      fn().catch((e: any) => console.error(`[telegram] ${label}:`, e?.message ?? e))
+      fn().catch((e: any) => log.error(label, { message: e?.message ?? String(e) }))
     }
 
-    async function createSession(chatId: string) {
+    async function createSession(cid: string) {
       try {
-        const res = await client.session.create({ body: { title: `Telegram ${chatId}` } })
+        const res = await client.session.create({ body: { title: `Telegram ${cid}` } })
         if (res.error) return null
         const sessionId = res.data.id
-        sessions.set(chatId, { sessionId, lastSent: null, lastReasoning: null, userPrompt: null, streamMsgId: null, inflight: false })
+        sessions.set(cid, { sessionId, lastSent: null, lastReasoning: null, userPrompt: null, streamMsgId: null, lastStreamEdit: null, inflight: false, inflightWait: null, inflightWaitTimer: null })
         persistSessions()
         return sessionId
       } catch (e: any) {
-        console.error("[telegram] createSession error:", e?.message ?? e)
+        log.error("createSession", { message: e?.message ?? String(e) })
         return null
       }
     }
-
 
     function chatOf(sessionId: string): string | null {
       for (const [cid, s] of sessions.entries()) {
@@ -120,20 +113,16 @@ export const TelegramCommand = effectCmd({
       return allowedUsers.length === 0 || allowedUsers.includes(chatId)
     }
 
-    function trunc(s: string, n: number) {
-      return s.length > n ? s.slice(0, n - 3) + "..." : s
-    }
-
     async function send(cid: string, msg: string) {
       if (!msg || !msg.trim()) return
       try {
         await bot.telegram.sendMessage(cid, trunc(msg, 4000))
       } catch (e: any) {
-        console.error("[telegram] send error:", e?.message ?? e)
+        log.error("send", { message: e?.message ?? String(e) })
       }
     }
 
-    // ── Streaming editor: edit the in-flight assistant message in
+    // Streaming editor: edit the in-flight assistant message in
     // place, or send a new one and remember its id. Skips the round-trip
     // when the new text is identical to what we last wrote (Telegram
     // also rejects no-op edits).
@@ -150,7 +139,7 @@ export const TelegramCommand = effectCmd({
           const m = await bot.telegram.sendMessage(cid, body)
           s.streamMsgId = m?.message_id ?? null
         } catch (e: any) {
-          console.error("[telegram] stream start error:", e?.message ?? e)
+          log.error("stream start", { message: e?.message ?? String(e) })
         }
         return
       }
@@ -158,24 +147,75 @@ export const TelegramCommand = effectCmd({
         await bot.telegram.editMessageText(cid, s.streamMsgId, undefined, body)
       } catch (e: any) {
         const msg = String(e?.message ?? e)
-        // "message is not modified" is harmless — content already matches.
         if (msg.includes("not modified")) return
         // Edit can fail if Telegram thinks the message is too old or the
         // text is identical; fall back to a fresh message.
-        console.error("[telegram] stream edit failed, sending new:", msg)
+        log.warn("stream edit failed, sending new", { message: msg })
         try {
           const m = await bot.telegram.sendMessage(cid, body)
           s.streamMsgId = m?.message_id ?? null
         } catch (e2: any) {
-          console.error("[telegram] stream fallback send error:", e2?.message ?? e2)
+          log.error("stream fallback send", { message: e2?.message ?? String(e2) })
         }
       }
     }
 
+    // Rate-limited wrapper around editOrSend. Telegram caps edits at
+    // ~20/min on the same message and ~30/min total; on a long reply
+    // a token-by-token stream would blow past both. We do leading-edge
+    // when the throttle window has elapsed, and trailing-edge otherwise
+    // so the user still sees the final value once the model goes quiet.
+    const STREAM_THROTTLE_MS = 1500
+    type StreamPending = { timer: ReturnType<typeof setTimeout>; text: string; s: SessionState }
+    const streamPending = new Map<string, StreamPending>()
+    function scheduleStreamEdit(s: SessionState, cid: string, text: string) {
+      if (!text || !text.trim()) return
+      if (s.streamMsgId == null) {
+        // No message yet — must sendMessage; throttle doesn't apply.
+        void editOrSend(s, cid, text)
+        return
+      }
+      const existing = streamPending.get(cid)
+      if (existing) {
+        // Coalesce: just overwrite the pending text. The trailing edit
+        // will pick up the latest value when the window opens.
+        existing.text = text
+        return
+      }
+      const now = Date.now()
+      const last = s.lastStreamEdit ?? 0
+      if (now - last >= STREAM_THROTTLE_MS) {
+        void editOrSend(s, cid, text)
+        s.lastStreamEdit = now
+        return
+      }
+      const delay = STREAM_THROTTLE_MS - (now - last)
+      const timer = setTimeout(() => {
+        const pending = streamPending.get(cid)
+        if (!pending) return
+        void editOrSend(pending.s, cid, pending.text)
+        pending.s.lastStreamEdit = Date.now()
+        streamPending.delete(cid)
+      }, delay)
+      streamPending.set(cid, { timer, text, s })
+    }
+    function clearPendingStreamEdit(cid: string) {
+      const pending = streamPending.get(cid)
+      if (!pending) return
+      clearTimeout(pending.timer)
+      streamPending.delete(cid)
+    }
+
     // Close the stream — next text part starts a new message. We don't
-    // delete the old one, just drop our handle.
-    function closeStream(s: SessionState) {
+    // delete the old one, just drop our handle. Also clear the
+    // throttle bookkeeping and any pending trailing edit so the new
+    // stream starts cleanly. Takes cid so it can drop the per-chat
+    // pending edit (which would otherwise fire after a delay and
+    // create a late "echo" of the just-closed stream).
+    function closeStream(s: SessionState, cid: string) {
       s.streamMsgId = null
+      s.lastStreamEdit = null
+      clearPendingStreamEdit(cid)
     }
 
     // ── Typing indicator ──────────────────────────────────────────
@@ -187,7 +227,7 @@ export const TelegramCommand = effectCmd({
       const tick = () => {
         bot.telegram
           .sendChatAction(cid, "typing")
-          .catch((e: any) => console.error("[telegram] sendChatAction error:", e?.message ?? e))
+          .catch((e: any) => log.error("sendChatAction", { message: e?.message ?? String(e) }))
       }
       tick()
       typingTimers.set(cid, setInterval(tick, 4000))
@@ -200,13 +240,6 @@ export const TelegramCommand = effectCmd({
       }
     }
 
-    // ── Media: download from Telegram + transcribe voice ─────────
-    // Whisper runs locally on Metal for voice transcription. Path is
-    // overridable so the same binary works on Linux (CPU whisper.cpp)
-    // or with a custom model size.
-    const WHISPER_BIN = process.env.WHISPER_BIN ?? "/opt/homebrew/bin/whisper-cli"
-    const WHISPER_MODEL = process.env.WHISPER_MODEL ?? path.join(Global.Path.home, "models", "whisper", "ggml-large-v3-turbo.bin")
-
     // Download a Telegram file by its file_id and return its raw bytes
     // plus a best-guess filename. Telegram's getFile returns a
     // file_path on the CDN which we can GET directly.
@@ -218,61 +251,6 @@ export const TelegramCommand = effectCmd({
       const mime = res.headers.get("content-type") ?? fallbackMime
       const filename = link.toString().split("/").pop() ?? fallbackName
       return { buffer: new Uint8Array(ab), filename, mime }
-    }
-
-    // Voice messages go through whisper.cpp to text. We don't ship the
-    // audio to the model — speech-as-text is just a richer text prompt.
-    async function transcribeAudio(buffer: Uint8Array, ext = "ogg"): Promise<string> {
-      if (!(await Bun.file(WHISPER_BIN).exists())) {
-        throw new Error(`whisper-cli not found at ${WHISPER_BIN} (set WHISPER_BIN env var to override)`)
-      }
-      if (!(await Bun.file(WHISPER_MODEL).exists())) {
-        throw new Error(`whisper model not found at ${WHISPER_MODEL} (set WHISPER_MODEL env var to override)`)
-      }
-      // whisper.cpp's audio decoder (dr_wav) only handles PCM/WAV and
-      // Ogg Vorbis — Telegram voice messages are Ogg Opus, which fails
-      // silently with "failed to read audio data as wav". Pipe the raw
-      // bytes through ffmpeg to canonical 16kHz mono PCM first, then
-      // hand the wav to whisper. 16kHz/mono is whisper's native input
-      // so we skip a redundant resample.
-      const id = Date.now()
-      const src = path.join(Global.Path.data, `voice-${id}.${ext}`)
-      const wav = path.join(Global.Path.data, `voice-${id}.wav`)
-      try {
-        await Bun.write(src, buffer)
-        const conv = Bun.spawn(
-          [
-            "ffmpeg", "-y", "-loglevel", "error",
-            "-i", src,
-            "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le",
-            wav,
-          ],
-          { stderr: "pipe" },
-        )
-        const convErr = await new Response(conv.stderr).text()
-        const convCode = await conv.exited
-        if (convCode !== 0) {
-          throw new Error(`ffmpeg conversion failed (${convCode}): ${convErr.trim()}`)
-        }
-        // -np = no progress, -otxt - = plain text to stdout.
-        const proc = Bun.spawn(
-          [WHISPER_BIN, "-m", WHISPER_MODEL, "-f", wav, "--no-timestamps", "-np", "-otxt", "-"],
-          { stderr: "pipe" },
-        )
-        const [text, werr, code] = await Promise.all([
-          new Response(proc.stdout).text(),
-          new Response(proc.stderr).text(),
-          proc.exited,
-        ])
-        if (code !== 0) {
-          throw new Error(`whisper-cli exited ${code}: ${werr.trim().split("\n").slice(-3).join(" | ")}`)
-        }
-        return text.trim()
-      } finally {
-        // Best-effort cleanup. Audio data may be sensitive (e.g.
-        // dictation of private notes), so don't leave it lying around.
-        await Bun.$`rm -f ${src} ${wav}`.quiet().nothrow()
-      }
     }
 
     // Send a prompt with arbitrary parts (text + file attachments) to
@@ -307,25 +285,28 @@ export const TelegramCommand = effectCmd({
       // would either queue server-side (silently delaying) or race
       // against the first, fragmenting the assistant output.
       if (session.inflight) {
-        console.error("[telegram] busy on session", session.sessionId, "— aborting previous")
+        log.warn("busy on session, aborting previous", { sessionId: session.sessionId })
         await reply(cid, "⏳ Bot is busy. Aborting the previous turn and sending your message…")
         try {
           await client.session.abort({ path: { id: session.sessionId } })
         } catch (e: any) {
-          console.error("[telegram] abort error:", e?.message ?? e)
+          log.error("abort", { message: e?.message ?? String(e) })
         }
-        // Wait for the server's idle event. Poll the inflight flag with
-        // a short backoff — the event-stream handler clears it on
-        // session.status.type === "idle". Cap at 5s to avoid hanging
-        // forever if the server never sends the event.
-        const idleDeadline = Date.now() + 5000
-        while (session.inflight && Date.now() < idleDeadline) {
-          await new Promise((r) => setTimeout(r, 50))
-        }
-        if (session.inflight) {
-          console.error("[telegram] abort timeout, forcing inflight clear")
-          session.inflight = false
-        }
+        // Event-driven idle wait: the session.status=idle handler in
+        // the event stream resolves inflightWait. A 5s safety timer
+        // force-resolves in case the event is lost — we don't want to
+        // hang a user prompt forever.
+        await new Promise<void>((resolve) => {
+          session.inflightWait = resolve
+          session.inflightWaitTimer = setTimeout(() => {
+            if (!session.inflightWait) return
+            log.warn("idle wait timeout, forcing inflight clear", { sessionId: session.sessionId })
+            session.inflight = false
+            session.inflightWait = null
+            session.inflightWaitTimer = null
+            resolve()
+          }, 5000)
+        })
       }
       session.userPrompt = userPromptForEcho
       session.inflight = true
@@ -334,10 +315,6 @@ export const TelegramCommand = effectCmd({
         body: { parts: parts as any },
       })
       if (result.error) {
-        // If the prompt itself failed, release the inflight flag so
-        // the next message doesn't think the previous one is still
-        // running. (The event stream will also clear it on the next
-        // idle event, but that may be a while away.)
         session.inflight = false
         return { error: result.error.data?.message ?? "Failed" as const }
       }
@@ -347,283 +324,11 @@ export const TelegramCommand = effectCmd({
       return { ok: true as const }
     }
 
-    // Model catalog for /model. The v2 server has no /config endpoint
-    // (verified: GET /v2/config → 404, /v1/config → 400), so we can't ask
-    // the server. Curated to only the providers Kaede uses:
-    //   oMLX    — local OpenAI-compatible server on :8000, fast local
-    //             inference on Apple Silicon. Provider id is the literal
-    //             string "omlx" because the server picks providers up
-    //             from `provider: { "<id>": {...} }` in opencode.jsonc.
-    //   anthropic — actually minimax via ANTHROPIC_BASE_URL env
-    //             (https://api.minimaxi.com/anthropic). When that env is
-    //             set, the opencode server routes all `anthropic/*`
-    //             models through minimax's Anthropic-compatible API.
-    //             So /model has to advertise models under the
-    //             `anthropic/` provider prefix even though the endpoint
-    //             is minimax. Model name "MiniMax-M3" is the literal
-    //             API model id the server forwards.
-    type ModelEntry = { providerID: string; modelID: string; name: string }
-    const KNOWN_PROVIDERS: ModelEntry[] = [
-      { providerID: "omlx", modelID: "Qwen3.6-35B-A3B-Claude-4.7-Opus-Reasoning-Distilled-MLX-oQ4-MTP", name: "oMLX · Qwen 3.6 35B" },
-      { providerID: "anthropic", modelID: "MiniMax-M3", name: "MiniMax · MiniMax-M3 (1M ctx, via anthropic route)" },
-      { providerID: "anthropic", modelID: "MiniMax-M2.7-highspeed", name: "MiniMax · MiniMax-M2.7 highspeed" },
-      { providerID: "anthropic", modelID: "MiniMax-M2.7", name: "MiniMax · MiniMax-M2.7 (200K ctx)" },
-    ]
-    function getModelCatalog(): ModelEntry[] {
-      return KNOWN_PROVIDERS
-    }
-    // Get the currently active default model from env or user config.
-    // Used by /model to mark the current entry with a ✓ in the list.
-    // Read the latest assistant message's token usage straight from the
-    // server's SQLite DB. The server's session.get() doesn't expose
-    // accumulated token counts (it returns the session struct but not
-    // a rolled-up total), so we have to query the database directly.
-    //
-    // Open-code persists each assistant message's LLM usage in
-    // message.data.tokens:
-    //   { total, input, output, reasoning, cache: { read, write } }
-    //
-    // WAL mode is on, so we open a separate readonly connection and
-    // read the latest assistant row by time_created. We also pull the
-    // model's contextLimit from the provider/model config so the
-    // percentage readout is meaningful.
-    function getSessionTokens(sessionID: string): {
-      total: number
-      input: number
-      output: number
-      reasoning: number
-      cacheRead: number
-      cacheWrite: number
-      modelContextLimit: number | null
-    } | null {
-      let db: BunDB | null = null
-      try {
-        // Same DB path logic as @opencode-ai/core/database/path().
-        // We replicate it inline to avoid pulling the whole Database
-        // effect layer (and its boot-time side effects) into the bot.
-        const dataDir = Global.Path.data
-        const flagOverride = process.env.OPENCODE_DB
-        let dbPath: string
-        if (flagOverride) {
-          dbPath = flagOverride === ":memory:" || flagOverride.startsWith("/")
-            ? flagOverride
-            : path.join(dataDir, flagOverride)
-        } else {
-          // The bot's channel is whatever InstallationChannel resolves to
-          // at build time. On dev/checkout installs it ends up in
-          // "opencode-dev.db"; on prod it's "opencode.db". We probe both
-          // (dev first, since that's what the dev binary writes).
-          const candidates = [
-            path.join(dataDir, "opencode-dev.db"),
-            path.join(dataDir, "opencode.db"),
-          ]
-          dbPath = candidates.find((p) => fs.existsSync(p)) ?? candidates[0]
-        }
-        if (!fs.existsSync(dbPath)) return null
-        // readonly=true forces SQLite to use the WAL shadow file
-        // without trying to take a write lock — safe to run while the
-        // server is actively writing to the same DB.
-        db = new BunDB(dbPath, { readonly: true })
-        const row = db
-          .query<{
-            data: string
-          }, [string]>(
-            `SELECT data
-               FROM message
-              WHERE session_id = ? AND data LIKE '%"role":"assistant"%'
-              ORDER BY time_created DESC
-              LIMIT 1`,
-          )
-          .get(sessionID)
-        if (!row) return null
-        const msg = JSON.parse(row.data) as {
-          tokens?: {
-            total?: number
-            input?: number
-            output?: number
-            reasoning?: number
-            cache?: { read?: number; write?: number }
-          }
-        }
-        const t = msg.tokens
-        if (!t) return null
-        // Look up the model's context limit from the live config so
-        // the percentage readout means something. We pull it from
-        // either OPENCODE_DEFAULT_MODEL env or the config file.
-        const cur = getCurrentModel()
-        let modelContextLimit: number | null = null
-        if (cur) {
-          const limits: Record<string, number> = {
-            "MiniMax-M3": 1_000_000,
-            "MiniMax-M2.7": 204_800,
-            "MiniMax-M2.7-highspeed": 204_800,
-            "MiniMax-M2.5": 204_800,
-            "MiniMax-M2.1": 204_800,
-            "MiniMax-M2": 204_800,
-            "MiniMax-M2-her": 65_536,
-            "claude-sonnet-4-5": 200_000,
-            "claude-opus-4-5": 200_000,
-            "claude-opus-4-6": 200_000,
-          }
-          modelContextLimit = limits[cur.modelID] ?? null
-        }
-        return {
-          total: t.total ?? 0,
-          input: t.input ?? 0,
-          output: t.output ?? 0,
-          reasoning: t.reasoning ?? 0,
-          cacheRead: t.cache?.read ?? 0,
-          cacheWrite: t.cache?.write ?? 0,
-          modelContextLimit,
-        }
-      } catch (e) {
-        console.error("[telegram] getSessionTokens failed:", e)
-        return null
-      } finally {
-        try { db?.close() } catch {}
-      }
-    }
-    function getCurrentModel(): { providerID: string; modelID: string } | null {
-      const envModel = process.env.OPENCODE_DEFAULT_MODEL
-      if (envModel && envModel.includes("/")) {
-        const [p, m] = envModel.split("/", 2)
-        return { providerID: p, modelID: m }
-      }
-      if (envModel) return { providerID: process.env.OPENCODE_DEFAULT_PROVIDER ?? "opencode", modelID: envModel }
-      // Fall back to the opencode config file. Same probe order as
-      // setDefaultModel() below — they must agree on the filename or
-      // we write to one and read from the other and silently show
-      // "(server default)".
-      try {
-        const configDir = process.env.OPENCODE_CONFIG_DIR ?? path.join(os.homedir(), ".config", "opencode")
-        for (const name of ["opencode.jsonc", "opencode.json"]) {
-          const cfgPath = path.join(configDir, name)
-          if (!fs.existsSync(cfgPath)) continue
-          const raw = fs.readFileSync(cfgPath, "utf8")
-          // .jsonc: strip line/block comments before JSON.parse
-          const stripped = name.endsWith(".jsonc")
-            ? raw.replace(/^\s*\/\/.*$/gm, "").replace(/\/\*[\s\S]*?\*\//g, "")
-            : raw
-          const cfg = JSON.parse(stripped) as any
-          // Prefer the flat `model: "provider/model"` (set by
-          // setDefaultModel and by opencode itself). Fall back to
-          // scanning the provider Record<providerID, ProviderConfig>
-          // for the first entry that has a model.
-          const m = cfg.model
-          if (m && typeof m === "string") {
-            if (m.includes("/")) {
-              const [pp, mm] = m.split("/", 2)
-              return { providerID: pp, modelID: mm }
-            }
-            return {
-              providerID: process.env.OPENCODE_DEFAULT_PROVIDER ?? "opencode",
-              modelID: m,
-            }
-          }
-          if (cfg.provider && typeof cfg.provider === "object") {
-            for (const [pid, pcfg] of Object.entries(cfg.provider) as [string, any][]) {
-              if (pcfg && typeof pcfg === "object" && typeof pcfg.model === "string") {
-                return { providerID: pid, modelID: pcfg.model }
-              }
-            }
-          }
-        }
-      } catch {}
-      return null
-    }
-    // Persist a new default provider/model to the opencode config file.
-    // The server reads opencode.json (or .jsonc) at boot. We probe both
-    // filenames and only create one if the user has a config dir but no
-    // config file at all — we don't want to materialize a stale file the
-    // user never asked for.
-    function setDefaultModel(
-      providerID: string,
-      modelID: string,
-    ): { ok: true } | { ok: false; error: string } {
-      try {
-        const configDir = process.env.OPENCODE_CONFIG_DIR ?? path.join(os.homedir(), ".config", "opencode")
-        // Order matters: opencode.jsonc (json-with-comments, the default
-        // for new installs) first, then opencode.json. We don't try
-        // config.yaml here — adding yaml deps just for this is overkill
-        // and the user can edit the file directly if they're on yaml.
-        const candidates = ["opencode.jsonc", "opencode.json"]
-        for (const name of candidates) {
-          const p = path.join(configDir, name)
-          if (!fs.existsSync(p)) continue
-          // .jsonc: strip // line comments and /* block comments */
-          // before JSON.parse. Cheap and good enough for the config
-          // we generate (no // inside string values).
-          const raw = fs.readFileSync(p, "utf8")
-          const stripped = name.endsWith(".jsonc")
-            ? raw
-                .replace(/^\s*\/\/.*$/gm, "")
-                .replace(/\/\*[\s\S]*?\*\//g, "")
-            : raw
-          const cfg = JSON.parse(stripped) as any
-          // Opencode config schema: `provider` is a Record<providerID,
-          // ProviderConfig> where ProviderConfig has `model` and
-          // `options` (no flat `id` field — the key IS the provider id).
-          // See packages/core/src/v1/config/provider.ts ProviderConfig.
-          // Special case: `anthropic` provider when ANTHROPIC_BASE_URL
-          // env is set. The server picks up the provider from the env,
-          // so we don't write it into the `provider` map here — just
-          // record the default model at top level. Writing a stale
-          // `options: { baseURL, apiKey }` would shadow the env.
-          if (providerID === "anthropic") {
-            cfg.model = `${providerID}/${modelID}`
-          } else {
-            if (!cfg.provider || typeof cfg.provider !== "object" || Array.isArray(cfg.provider)) {
-              cfg.provider = {}
-            }
-            const existing = cfg.provider[providerID] ?? {}
-            cfg.provider[providerID] = { ...existing, model: modelID }
-            cfg.model = `${providerID}/${modelID}`
-          }
-          // Write back. Drop $schema first so we can put it back at
-          // the top (the JSON.stringify key order would otherwise
-          // re-emit it wherever it happened to be after the spread).
-          const schema = cfg.$schema
-          delete cfg.$schema
-          const ordered: any = schema ? { $schema: schema, ...cfg } : cfg
-          fs.writeFileSync(p, JSON.stringify(ordered, null, 2) + "\n")
-          return { ok: true }
-        }
-        // No existing config file — refuse rather than create a new one
-        // the user didn't ask for. Tell them what to create.
-        return {
-          ok: false,
-          error: `No opencode.json/opencode.jsonc in ${configDir}. Create one with at least: { "provider": { "${providerID}": { "model": "${modelID}" } } }`,
-        }
-      } catch (e: any) {
-        return { ok: false, error: e?.message ?? String(e) }
-      }
-    }
-    // Resolve a user query against the catalog. Strict match on
-    // "providerID/modelID", then prefix/suffix match on modelID,
-    // then case-insensitive name contains. Returns undefined if no hit.
-    function resolveModel(query: string, catalog: ModelEntry[]): ModelEntry | undefined {
-      const q = query.trim()
-      if (!q) return undefined
-      if (q.includes("/")) {
-        const [p, m] = q.split("/", 2)
-        return catalog.find((c) => c.providerID === p && c.modelID === m)
-      }
-      // Exact modelID first
-      const exact = catalog.find((c) => c.modelID === q)
-      if (exact) return exact
-      // Suffix match (e.g. "claude-sonnet-4-5" against "anthropic/claude-sonnet-4-5")
-      const suffix = catalog.find((c) => c.modelID.endsWith(q) || c.modelID.includes(q))
-      if (suffix) return suffix
-      // Name contains
-      const lower = q.toLowerCase()
-      return catalog.find((c) => c.name.toLowerCase().includes(lower))
-    }
-
     async function reply(cid: string, msg: string, extras?: any) {
       try {
         await bot.telegram.sendMessage(cid, msg, extras)
       } catch (e: any) {
-        console.error("[telegram] reply error:", e?.message ?? e)
+        log.error("reply", { message: e?.message ?? String(e) })
       }
     }
 
@@ -642,7 +347,7 @@ export const TelegramCommand = effectCmd({
           headers: { "Content-Type": "application/json", "x-opencode-directory": encodeURIComponent(process.cwd()) },
           body: JSON.stringify({ answers }),
         })
-        console.error("[telegram] question reply status:", res.status)
+        log.debug("question reply status", { status: res.status })
         if (!res.ok) {
           const text = await res.text().catch(() => "")
           await reply(cid, `❌ Question reply failed (${res.status}): ${text.slice(0, 200)}`)
@@ -651,13 +356,13 @@ export const TelegramCommand = effectCmd({
           await reply(cid, "✅ Answer sent.")
         }
       } catch (e: any) {
-        console.error("[telegram] question reply error:", e?.message ?? e)
+        log.error("question reply", { message: e?.message ?? String(e) })
         await reply(cid, `❌ Question reply error: ${e?.message ?? e}`)
       }
     }
 
     // ── Session map (with JSON persistence) ───────────────────────
-    const SESSIONS_FILE = path.join(Global.Path.data, "telegram-sessions.json")
+    const SESSIONS_FILE = getSessionsFile()
     type SessionState = {
       sessionId: string
       lastSent: string | null
@@ -668,11 +373,25 @@ export const TelegramCommand = effectCmd({
       // boundary (reasoning / tool / patch / idle). Lets us edit the
       // same message instead of spamming new ones for every token.
       streamMsgId: number | null
+      // Wall-clock time (ms) of the last editMessageText to the
+      // streaming message. Used by the throttle in scheduleStreamEdit
+      // to enforce a minimum gap between edits.
+      lastStreamEdit: number | null
       // True while a session.promptAsync is in flight (between
       // dispatchPrompt start and the server's `session.status` idle
       // event). Gates the "busy" check in dispatchPrompt so a second
       // user message arriving mid-turn aborts the current task first.
       inflight: boolean
+      // Resolver for any dispatchPrompt currently waiting for this
+      // session to go idle. Set when a new prompt arrives mid-turn;
+      // called by the event stream's session.status=idle handler.
+      // Cleared after use. Lets us replace the old 50ms polling loop
+      // with a real event-driven wait.
+      inflightWait: (() => void) | null
+      // Safety timer paired with inflightWait. If the server never
+      // sends idle (e.g. lost event), force-resolve after 5s so the
+      // next prompt isn't held forever.
+      inflightWaitTimer: ReturnType<typeof setTimeout> | null
     }
     const sessions = new Map<string, SessionState>()
     // Track pending questions so callback buttons can resolve label from index
@@ -687,14 +406,14 @@ export const TelegramCommand = effectCmd({
         const data = yield* Effect.promise(() => Bun.file(SESSIONS_FILE).json())
         for (const [cid, sess] of Object.entries(data as Record<string, any>)) {
           // Backward compat: older session files don't have streamMsgId.
-          sessions.set(cid, { ...sess, streamMsgId: null, inflight: false })
+          sessions.set(cid, { ...sess, streamMsgId: null, lastStreamEdit: null, inflight: false, inflightWait: null, inflightWaitTimer: null })
         }
-        console.error("[telegram] loaded", sessions.size, "persisted sessions")
+        yield* Effect.logDebug("telegram loaded persisted sessions", { count: sessions.size })
       } catch (e: any) {
-        console.error("[telegram] failed to load sessions:", e?.message ?? e)
+        yield* Effect.logWarning("telegram failed to load sessions", { message: e?.message ?? String(e) })
       }
     } else {
-      console.error("[telegram] no persisted sessions file, starting fresh")
+      yield* Effect.logDebug("telegram no persisted sessions file, starting fresh")
     }
 
     // Persist sessions to disk (debounced)
@@ -705,7 +424,7 @@ export const TelegramCommand = effectCmd({
         try {
           await Bun.write(SESSIONS_FILE, JSON.stringify(Object.fromEntries(sessions), null, 2))
         } catch (e: any) {
-          console.error("[telegram] failed to persist sessions:", e?.message ?? e)
+          log.error("failed to persist sessions", { message: e?.message ?? String(e) })
         }
       }, 500)
     }
@@ -713,9 +432,9 @@ export const TelegramCommand = effectCmd({
     // ── Message handler ────────────────────────────────────────────
     bot.on("message", async (ctx: any) => {
       const cid = String(ctx.chat.id)
-      console.error("[telegram] message from", cid, "type:", ctx.chat.type, "subtype:", Object.keys(ctx.message ?? {}).filter((k) => !["date", "chat", "from", "message_id"].includes(k)).join(","))
+      log.debug("message received", { cid, chatType: ctx.chat.type, keys: Object.keys(ctx.message ?? {}).filter((k) => !["date", "chat", "from", "message_id"].includes(k)) })
       if (!allow(cid)) {
-        console.error("[telegram] chat", cid, "not in allowlist, ignoring")
+        log.debug("chat not in allowlist, ignoring", { cid })
         return
       }
       // In group chats, only respond when @-mentioned or to commands
@@ -724,7 +443,7 @@ export const TelegramCommand = effectCmd({
         const username = me?.username ? `@${me.username}` : ""
         const isCommand = (ctx.message?.text ?? "").startsWith("/")
         if (!isCommand && username && !(ctx.message?.text ?? "").includes(username)) {
-          console.error("[telegram] group message without mention, ignoring")
+          log.debug("group message without mention, ignoring")
           return
         }
       }
@@ -845,6 +564,8 @@ export const TelegramCommand = effectCmd({
           session.lastReasoning = null
           session.userPrompt = null
           session.streamMsgId = null
+          session.lastStreamEdit = null
+          clearPendingStreamEdit(cid)
           stopTyping(cid)
           await ctx.reply("✅ Task aborted.")
           return
@@ -923,9 +644,9 @@ export const TelegramCommand = effectCmd({
             const lastReasoning = session.lastReasoning
               ? ` (last: ${session.lastReasoning.length > 40 ? session.lastReasoning.slice(0, 37) + "..." : session.lastReasoning})`
               : ""
-            // Status state — derive from session.status when present, else
-            // fall back to "idle" (most queries land here).
-            const state = (session.status as any)?.type ?? data.status ?? "idle"
+            // Status state — read from server data, fall back to "idle"
+            // (most queries land here).
+            const state = data.status ?? "idle"
             const lines: string[] = [
               `📋 Session: \`${session.sessionId}\``,
               `🤖 Model: \`${current}\``,
@@ -1081,7 +802,7 @@ export const TelegramCommand = effectCmd({
               return
             }
             // Switch active session to the fork
-            sessions.set(cid, { sessionId: newId, lastSent: null, lastReasoning: null, userPrompt: null, streamMsgId: null, inflight: false })
+            sessions.set(cid, { sessionId: newId, lastSent: null, lastReasoning: null, userPrompt: null, streamMsgId: null, lastStreamEdit: null, inflight: false, inflightWait: null, inflightWaitTimer: null })
             await reply(cid, `🍴 Forked!\nOld: \`${s.sessionId.slice(0, 8)}…\`\nNew: \`${newId.slice(0, 8)}…\``)
           }, "fork handler")
           return
@@ -1113,6 +834,8 @@ export const TelegramCommand = effectCmd({
             s.lastReasoning = null
             s.userPrompt = null
             s.streamMsgId = null
+            s.lastStreamEdit = null
+            clearPendingStreamEdit(cid)
             stopTyping(cid)
             const res = await dispatchPrompt(cid, [{ type: "text", text }], text)
             if (res?.error) await reply(cid, `Error: ${res.error}`)
@@ -1163,14 +886,14 @@ export const TelegramCommand = effectCmd({
 
     // ── Callback query handler ────────────────────────────────────
     bot.on("callback_query", async (ctx: any) => {
-      console.error("[telegram] DEBUG: callback_query event fired, data:", ctx.callbackQuery?.data)
+      log.debug("callback_query event fired", { data: ctx.callbackQuery?.data })
       // Telegraf 4.x: answer via ctx.telegram.answerCallbackQuery
       if (ctx.telegram?.answerCallbackQuery) {
         await ctx.telegram.answerCallbackQuery(ctx.callbackQuery?.id).catch(() => {})
       } else if (typeof ctx.answerCallbackQuery === "function") {
         await ctx.answerCallbackQuery().catch(() => {})
       } else {
-        console.error("[telegram] answerCallbackQuery not found, ctx keys:", Object.keys(ctx))
+        log.warn("answerCallbackQuery not found", { keys: Object.keys(ctx) })
       }
       const data = ctx.callbackQuery?.data
       if (!data) return
@@ -1178,7 +901,7 @@ export const TelegramCommand = effectCmd({
       if (!msg) return
       const cid = String(msg.chat.id)
       if (!allow(cid)) {
-        console.error("[telegram] callback from non-allowlisted chat", cid, ", ignoring")
+        log.debug("callback from non-allowlisted chat, ignoring", { cid })
         return
       }
       const session = sessions.get(cid)
@@ -1253,7 +976,7 @@ export const TelegramCommand = effectCmd({
             await reply(cid, `❌ Session not found: ${newId.slice(0, 8)}…`)
             return
           }
-          sessions.set(cid, { sessionId: newId, lastSent: null, lastReasoning: null, userPrompt: null, streamMsgId: null, inflight: false })
+          sessions.set(cid, { sessionId: newId, lastSent: null, lastReasoning: null, userPrompt: null, streamMsgId: null, lastStreamEdit: null, inflight: false, inflightWait: null, inflightWaitTimer: null })
           stopTyping(cid)
           const title = (ver as any).data?.title ?? "(untitled)"
           await reply(cid, `✅ Switched to \`${newId.slice(0, 8)}…\` — ${trunc(title, 40)}`)
@@ -1273,13 +996,13 @@ export const TelegramCommand = effectCmd({
           path: { id: session.sessionId, permissionID },
           body: { response },
         })
-        console.error("[telegram] permission response:", JSON.stringify(res))
+        log.debug("permission response", { res })
         if (res.error) {
           const err = res.error as { _tag?: string; message?: string }
           // PermissionNotFoundError means user pressed a button twice or the request
           // already resolved — not a real error, just ignore silently.
           if (err._tag === "PermissionNotFoundError") {
-            console.error("[telegram] permission already resolved, ignoring duplicate click")
+            log.debug("permission already resolved, ignoring duplicate click")
             return
           }
           const msg = err.message ?? "Unknown error"
@@ -1292,16 +1015,21 @@ export const TelegramCommand = effectCmd({
     })
 
     // ── Event stream ──────────────────────────────────────────────
-    console.error("[telegram] starting event stream IIFE...")
+    // Reconnect backoff for the SSE event stream. Reset to 0 on
+    // successful subscribe.
+    const RECONNECT_BASE_MS = 1000
+    const RECONNECT_MAX_MS = 60_000
+    let reconnectAttempts = 0
     ;(async () => {
       while (true) {
         try {
-          console.error("[telegram] before event.subscribe()")
+          log.debug("connecting event stream")
           const events = await client.event.subscribe()
-          console.error("[telegram] event stream connected, waiting...")
+          reconnectAttempts = 0
+          log.debug("event stream connected")
           for await (const ev of events.stream) {
             try {
-              console.error("[telegram] event:", ev.type)
+              log.debug("event", { type: ev.type })
               if (ev.type === "session.status") {
                 const props = ev.properties as { sessionID: string; status: { type: string } }
                 const cid = chatOf(props.sessionID)
@@ -1317,7 +1045,18 @@ export const TelegramCommand = effectCmd({
                       s.lastReasoning = null
                       s.userPrompt = null
                       s.streamMsgId = null
+                      s.lastStreamEdit = null
                       s.inflight = false
+                      // Wake any dispatchPrompt waiting for idle. The
+                      // safety timer is cleared because the real idle
+                      // event arrived in time.
+                      if (s.inflightWaitTimer) clearTimeout(s.inflightWaitTimer)
+                      if (s.inflightWait) {
+                        s.inflightWait()
+                        s.inflightWait = null
+                        s.inflightWaitTimer = null
+                      }
+                      clearPendingStreamEdit(cid)
                       stopTyping(cid)
                     } else {
                       // busy / retry — show "typing" indicator
@@ -1330,13 +1069,15 @@ export const TelegramCommand = effectCmd({
 
               // Session error — notify the user. Without this the bot goes
               // silent when the model or a tool fails, and the user has no
-              // way to tell that anything went wrong.
+              // way to tell that anything went wrong. Also wake any
+              // dispatchPrompt waiting for idle so it doesn't hang on the
+              // 5s safety timer.
               if (ev.type === "session.error") {
                 const err = ev.properties as {
                   sessionID?: string
                   error?: { name?: string; message?: string; data?: { message?: string } }
                 }
-                console.error("[telegram] session.error:", JSON.stringify(err))
+                log.debug("session.error", { err })
                 const sid = err.sessionID
                 if (!sid) continue
                 const cid = chatOf(sid)
@@ -1347,6 +1088,16 @@ export const TelegramCommand = effectCmd({
                   s.lastReasoning = null
                   s.userPrompt = null
                   s.streamMsgId = null
+                  s.lastStreamEdit = null
+                  s.inflight = false
+                  clearPendingStreamEdit(cid)
+                  if (s.inflightWaitTimer) clearTimeout(s.inflightWaitTimer)
+                  if (s.inflightWait) {
+                    s.inflightWait()
+                    s.inflightWait = null
+                    s.inflightWaitTimer = null
+                  }
+                  clearPendingStreamEdit(cid)
                 }
                 stopTyping(cid)
                 const name = err.error?.name ?? "Error"
@@ -1365,13 +1116,12 @@ export const TelegramCommand = effectCmd({
                   patterns: string[]
                   metadata?: Record<string, unknown>
                 }
-                console.error("[telegram] permission.asked:", JSON.stringify(perm))
+                log.debug("permission.asked", { perm })
                 const cid = chatOf(perm.sessionID)
                 if (!cid) {
-                  console.error("[telegram] permission session not found in sessions map, sessionIDs:", [...sessions.values()].map(s => s.sessionId))
+                  log.debug("permission session not found in sessions map", { knownSessionIds: [...sessions.values()].map(s => s.sessionId) })
                   continue
                 }
-                console.error("[telegram] sending permission buttons to cid:", cid)
 
                 const pattern = perm.patterns.join(", ")
                 const shortPattern = trunc(pattern, 200)
@@ -1385,7 +1135,7 @@ export const TelegramCommand = effectCmd({
                   [Markup.button.callback("❌ Deny", `perm:${perm.id}:deny`)],
                 ])
                 await reply(cid, msg, btns)
-                console.error("[telegram] permission buttons sent")
+                log.debug("permission buttons sent")
                 continue
               }
 
@@ -1400,10 +1150,10 @@ export const TelegramCommand = effectCmd({
                     options: Array<{ label: string; description: string }>
                   }>
                 }
-                console.error("[telegram] question.asked:", JSON.stringify(q))
+                log.debug("question.asked", { q })
                 const cid = chatOf(q.sessionID)
                 if (!cid) {
-                  console.error("[telegram] question session not found")
+                  log.debug("question session not found")
                   continue
                 }
                 for (const question of q.questions) {
@@ -1421,7 +1171,7 @@ export const TelegramCommand = effectCmd({
                   }
                   const btns = Markup.inlineKeyboard(rows)
                   await reply(cid, text, btns)
-                  console.error("[telegram] question buttons sent for", question.header)
+                  log.debug("question buttons sent", { header: question.header })
                 }
                 continue
               }
@@ -1446,12 +1196,12 @@ export const TelegramCommand = effectCmd({
                   s.userPrompt = null
                   if (rest.trim()) {
                     s.lastSent = rest
-                    await editOrSend(s, cid, rest)
+                    scheduleStreamEdit(s, cid, rest)
                   }
                   continue
                 }
                 s.lastSent = p.text
-                await editOrSend(s, cid, p.text)
+                scheduleStreamEdit(s, cid, p.text)
               } else if (part.type === "reasoning") {
                 // Reasoning breaks the text stream — close it first so the
                 // next text chunk opens a fresh message.
@@ -1459,14 +1209,14 @@ export const TelegramCommand = effectCmd({
                 if (!p.text || !p.text.trim()) continue
                 if (s.lastReasoning === p.text) continue
                 s.lastReasoning = p.text
-                closeStream(s)
+                closeStream(s, cid)
                 send(cid, `🧠 Thinking:\n\n${p.text}`)
               } else if (part.type === "tool") {
                 // Each tool completion is its own notification, not part
                 // of the streaming text message.
                 const p = part as { tool: string; state: { status: string; title?: string } }
                 if (p.state.status === "completed" && p.state.title) {
-                  closeStream(s)
+                  closeStream(s, cid)
                   send(cid, `🔧 ${p.tool}: ${p.state.title}`)
                 }
               } else if (part.type === "patch") {
@@ -1479,7 +1229,7 @@ export const TelegramCommand = effectCmd({
                   files: Array<{ path: string; additions?: number; deletions?: number }>
                 }
                 if (!p.files?.length) continue
-                closeStream(s)
+                closeStream(s, cid)
                 const lines = p.files.map((f) => {
                   const add = f.additions ?? 0
                   const del = f.deletions ?? 0
@@ -1488,19 +1238,25 @@ export const TelegramCommand = effectCmd({
                 send(cid, `📝 ${p.files.length} file${p.files.length === 1 ? "" : "s"} changed:\n${lines.join("\n")}`)
               }
             } catch (evErr: any) {
-              console.error("[telegram] event loop inner error:", evErr?.message ?? evErr)
+              log.error("event loop inner error", { message: evErr?.message ?? String(evErr) })
             }
           }
         } catch (streamErr: any) {
-          console.error("[telegram] event stream disconnected, reconnecting in 5s:", streamErr?.message ?? streamErr)
-          await new Promise(r => setTimeout(r, 5000))
+          // Exponential backoff: 1s, 2s, 4s, 8s, ... up to 60s, with
+          // up to 30% jitter so a fleet of bots reconnecting at once
+          // don't synchronize into a thundering herd. Reset to 0 on
+          // the next successful subscribe.
+          const base = Math.min(RECONNECT_MAX_MS, RECONNECT_BASE_MS * 2 ** reconnectAttempts)
+          const jitter = base * 0.3 * Math.random()
+          const delay = Math.round(base + jitter)
+          reconnectAttempts++
+          log.warn("event stream disconnected, reconnecting", { attempt: reconnectAttempts, delayMs: delay, message: streamErr?.message ?? String(streamErr) })
+          await new Promise(r => setTimeout(r, delay))
         }
       }
     })()
-    console.error("[telegram] event stream started")
 
     // ── Register bot commands so Telegram shows the command menu ──────────
-    console.error("[telegram] setting bot commands...")
     bot.telegram.setMyCommands([
       { command: "start", description: "Welcome message" },
       { command: "new", description: "Create a new session" },
@@ -1514,14 +1270,13 @@ export const TelegramCommand = effectCmd({
       { command: "sessions", description: "List & switch sessions" },
       { command: "whoami", description: "Show your chat ID" },
       { command: "help", description: "Show all commands" },
-    ]).then(() => console.error("[telegram] setMyCommands done")).catch((e: any) => console.error("[telegram] setMyCommands error:", e?.message ?? e))
+    ]).then(() => log.debug("setMyCommands done")).catch((e: any) => log.error("setMyCommands", { message: e?.message ?? String(e) }))
 
     // ── Launch ─────────────────────────────────────────────────────
-    console.error("[telegram] launching bot...")
     bot.launch().then(() => {
-      console.error("[telegram] bot.launch() unexpectedly resolved")
+      log.debug("bot.launch() unexpectedly resolved")
     }).catch((err: any) => {
-      console.error("[telegram] bot.launch() error:", err?.message ?? err)
+      log.error("bot.launch()", { message: err?.message ?? String(err) })
     })
 
     // Clean up typing timers on shutdown so node doesn't keep the
@@ -1537,12 +1292,11 @@ export const TelegramCommand = effectCmd({
       cleanupTyping()
       bot.stop("SIGTERM")
     })
-    console.error("[telegram] calling getMe...")
     bot.telegram.getMe().then((me: any) => {
-      console.error("[telegram] getMe SUCCESS:", me.username)
+      log.info("getMe success", { username: me.username })
       UI.println(UI.Style.TEXT_INFO_BOLD + "  Telegram:     ", UI.Style.TEXT_NORMAL, `@${me.username}`)
     }).catch((e: any) => {
-      console.error("[telegram] getMe error:", e?.message ?? e)
+      log.warn("getMe failed", { message: e?.message ?? String(e) })
       UI.println(UI.Style.TEXT_INFO_BOLD + "  Telegram:     ", UI.Style.TEXT_NORMAL, "(unverified)")
     })
 
@@ -1551,8 +1305,9 @@ export const TelegramCommand = effectCmd({
     }
     UI.empty()
 
-    console.error("[telegram] entering Effect.never...")
     // Keep process alive — bot polling runs in background
     yield* Effect.never
   }),
 })
+
+export * as Telegram from "."
