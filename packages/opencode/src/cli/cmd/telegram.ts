@@ -87,7 +87,7 @@ export const TelegramCommand = effectCmd({
         const res = await client.session.create({ body: { title: `Telegram ${chatId}` } })
         if (res.error) return null
         const sessionId = res.data.id
-        sessions.set(chatId, { sessionId, lastSent: null, lastReasoning: null, userPrompt: null })
+        sessions.set(chatId, { sessionId, lastSent: null, lastReasoning: null, userPrompt: null, streamMsgId: null })
         persistSessions()
         return sessionId
       } catch (e: any) {
@@ -149,6 +149,68 @@ export const TelegramCommand = effectCmd({
       }
     }
 
+    // ── Streaming editor: edit the in-flight assistant message in
+    // place, or send a new one and remember its id. Skips the round-trip
+    // when the new text is identical to what we last wrote (Telegram
+    // also rejects no-op edits).
+    async function editOrSend(s: SessionState, cid: string, text: string) {
+      if (!text || !text.trim()) return
+      const body = trunc(text, 4000)
+      if (s.streamMsgId == null) {
+        try {
+          const m = await bot.telegram.sendMessage(cid, body)
+          s.streamMsgId = m?.message_id ?? null
+        } catch (e: any) {
+          console.error("[telegram] stream start error:", e?.message ?? e)
+        }
+        return
+      }
+      try {
+        await bot.telegram.editMessageText(cid, s.streamMsgId, undefined, body)
+      } catch (e: any) {
+        const msg = String(e?.message ?? e)
+        // "message is not modified" is harmless — content already matches.
+        if (msg.includes("not modified")) return
+        // Edit can fail if Telegram thinks the message is too old or the
+        // text is identical; fall back to a fresh message.
+        console.error("[telegram] stream edit failed, sending new:", msg)
+        try {
+          const m = await bot.telegram.sendMessage(cid, body)
+          s.streamMsgId = m?.message_id ?? null
+        } catch (e2: any) {
+          console.error("[telegram] stream fallback send error:", e2?.message ?? e2)
+        }
+      }
+    }
+
+    // Close the stream — next text part starts a new message. We don't
+    // delete the old one, just drop our handle.
+    function closeStream(s: SessionState) {
+      s.streamMsgId = null
+    }
+
+    // ── Typing indicator ──────────────────────────────────────────
+    // Telegram expires the "typing" chat action after ~5s, so we
+    // re-send it every 4s while a session is busy.
+    const typingTimers = new Map<string, ReturnType<typeof setInterval>>()
+    function startTyping(cid: string) {
+      if (typingTimers.has(cid)) return
+      const tick = () => {
+        bot.telegram
+          .sendChatAction(cid, "typing")
+          .catch((e: any) => console.error("[telegram] sendChatAction error:", e?.message ?? e))
+      }
+      tick()
+      typingTimers.set(cid, setInterval(tick, 4000))
+    }
+    function stopTyping(cid: string) {
+      const t = typingTimers.get(cid)
+      if (t) {
+        clearInterval(t)
+        typingTimers.delete(cid)
+      }
+    }
+
     async function reply(cid: string, msg: string, extras?: any) {
       try {
         await bot.telegram.sendMessage(cid, msg, extras)
@@ -159,7 +221,18 @@ export const TelegramCommand = effectCmd({
 
     // ── Session map (with JSON persistence) ───────────────────────
     const SESSIONS_FILE = path.join(Global.Path.data, "telegram-sessions.json")
-    const sessions = new Map<string, { sessionId: string; lastSent: string | null; lastReasoning: string | null; userPrompt: string | null }>()
+    type SessionState = {
+      sessionId: string
+      lastSent: string | null
+      lastReasoning: string | null
+      userPrompt: string | null
+      // Telegram message id of the currently-streaming assistant text
+      // message. Non-null between the first text chunk and the next
+      // boundary (reasoning / tool / patch / idle). Lets us edit the
+      // same message instead of spamming new ones for every token.
+      streamMsgId: number | null
+    }
+    const sessions = new Map<string, SessionState>()
     // Track pending questions so callback buttons can resolve label from index
     const pendingQuestions = new Map<string, { sessionID: string; options: Array<{ label: string; description: string }> }>()
     // Track which question each chat is currently waiting for a custom answer on
@@ -171,7 +244,8 @@ export const TelegramCommand = effectCmd({
       try {
         const data = yield* Effect.promise(() => Bun.file(SESSIONS_FILE).json())
         for (const [cid, sess] of Object.entries(data as Record<string, any>)) {
-          sessions.set(cid, sess)
+          // Backward compat: older session files don't have streamMsgId.
+          sessions.set(cid, { ...sess, streamMsgId: null })
         }
         console.error("[telegram] loaded", sessions.size, "persisted sessions")
       } catch (e: any) {
@@ -248,6 +322,11 @@ export const TelegramCommand = effectCmd({
           const session = sessions.get(cid)
           if (!session) { await ctx.reply("No active session."); return }
           await client.session.abort({ path: { id: session.sessionId } }).catch(() => {})
+          session.lastSent = null
+          session.lastReasoning = null
+          session.userPrompt = null
+          session.streamMsgId = null
+          stopTyping(cid)
           await ctx.reply("✅ Task aborted.")
           return
         }
@@ -392,11 +471,21 @@ export const TelegramCommand = effectCmd({
               console.error("[telegram] event:", ev.type)
               if (ev.type === "session.status") {
                 const props = ev.properties as { sessionID: string; status: { type: string } }
-                if (props.status?.type === "idle") {
-                  const cid = chatOf(props.sessionID)
-                  if (cid) {
-                    const s = sessions.get(cid)
-                    if (s) { s.lastSent = null; s.lastReasoning = null; s.userPrompt = null }
+                const cid = chatOf(props.sessionID)
+                if (cid) {
+                  const s = sessions.get(cid)
+                  if (s) {
+                    if (props.status?.type === "idle") {
+                      // Close any in-flight stream so the next turn starts
+                      // a fresh message.
+                      s.lastSent = null
+                      s.lastReasoning = null
+                      s.userPrompt = null
+                      s.streamMsgId = null
+                    } else {
+                      // busy / retry — show "typing" indicator
+                      startTyping(cid)
+                    }
                   }
                 }
                 continue
@@ -415,6 +504,14 @@ export const TelegramCommand = effectCmd({
                 if (!sid) continue
                 const cid = chatOf(sid)
                 if (!cid) continue
+                const s = sessions.get(cid)
+                if (s) {
+                  s.lastSent = null
+                  s.lastReasoning = null
+                  s.userPrompt = null
+                  s.streamMsgId = null
+                }
+                stopTyping(cid)
                 const name = err.error?.name ?? "Error"
                 const message = err.error?.data?.message ?? err.error?.message ?? "Unknown error"
                 await reply(cid, `❌ ${name}: ${trunc(message, 3500)}`)
@@ -512,21 +609,27 @@ export const TelegramCommand = effectCmd({
                   s.userPrompt = null
                   if (rest.trim()) {
                     s.lastSent = rest
-                    send(cid, rest)
+                    await editOrSend(s, cid, rest)
                   }
                   continue
                 }
                 s.lastSent = p.text
-                send(cid, p.text)
+                await editOrSend(s, cid, p.text)
               } else if (part.type === "reasoning") {
+                // Reasoning breaks the text stream — close it first so the
+                // next text chunk opens a fresh message.
                 const p = part as { text: string }
                 if (!p.text || !p.text.trim()) continue
                 if (s.lastReasoning === p.text) continue
                 s.lastReasoning = p.text
+                closeStream(s)
                 send(cid, `🧠 Thinking:\n\n${p.text}`)
               } else if (part.type === "tool") {
+                // Each tool completion is its own notification, not part
+                // of the streaming text message.
                 const p = part as { tool: string; state: { status: string; title?: string } }
                 if (p.state.status === "completed" && p.state.title) {
+                  closeStream(s)
                   send(cid, `🔧 ${p.tool}: ${p.state.title}`)
                 }
               } else if (part.type === "patch") {
@@ -539,6 +642,7 @@ export const TelegramCommand = effectCmd({
                   files: Array<{ path: string; additions?: number; deletions?: number }>
                 }
                 if (!p.files?.length) continue
+                closeStream(s)
                 const lines = p.files.map((f) => {
                   const add = f.additions ?? 0
                   const del = f.deletions ?? 0
@@ -576,6 +680,20 @@ export const TelegramCommand = effectCmd({
       console.error("[telegram] bot.launch() unexpectedly resolved")
     }).catch((err: any) => {
       console.error("[telegram] bot.launch() error:", err?.message ?? err)
+    })
+
+    // Clean up typing timers on shutdown so node doesn't keep the
+    // event loop alive with stray intervals if bot.stop() races.
+    const cleanupTyping = () => {
+      for (const cid of [...typingTimers.keys()]) stopTyping(cid)
+    }
+    process.once("SIGINT", () => {
+      cleanupTyping()
+      bot.stop("SIGINT")
+    })
+    process.once("SIGTERM", () => {
+      cleanupTyping()
+      bot.stop("SIGTERM")
     })
     console.error("[telegram] calling getMe...")
     bot.telegram.getMe().then((me: any) => {
