@@ -72,7 +72,16 @@ export const TelegramCommand = effectCmd({
     console.error("[telegram] importing Telegraf...")
     const { Telegraf, Markup } = yield* Effect.promise(() => import("telegraf"))
     console.error("[telegram] Telegraf imported, creating bot...")
-    const bot = new Telegraf(token) as any
+    // handlerTimeout default in Telegraf is 90s. Our command handlers
+    // do fire-and-forget dispatch via `safe()`, so a single command
+    // should resolve within milliseconds. A 90s window is dangerous:
+    // if anything inside the handler awaits a slow network call
+    // (Telegram API, opencode SDK), the whole long-poll cycle freezes
+    // for 90s, the bot appears unresponsive, and the next user
+    // message queues up behind the stuck one. 5s is plenty for our
+    // handlers — anything slower than that almost certainly is the
+    // Telegram API itself, which we don't want to block polling on.
+    const bot = new Telegraf(token, { handlerTimeout: 5_000 }) as any
     console.error("[telegram] bot created")
 
     // ── Global error handler ──────────────────────────────────────
@@ -412,7 +421,7 @@ export const TelegramCommand = effectCmd({
         db = new BunDB(dbPath, { readonly: true })
         const row = db
           .query<{
-            tokens: string
+            data: string
           }, [string]>(
             `SELECT data
                FROM message
@@ -421,9 +430,8 @@ export const TelegramCommand = effectCmd({
               LIMIT 1`,
           )
           .get(sessionID)
-        console.error("[telegram] getSessionTokens: sessionID=", sessionID, "dbPath=", dbPath, "row=", row ? "found" : "null")
         if (!row) return null
-        const msg = JSON.parse(row.tokens) as {
+        const msg = JSON.parse(row.data) as {
           tokens?: {
             total?: number
             input?: number
