@@ -141,6 +141,7 @@ export const layer = Layer.effect(
     const sessions = yield* SessionStore.Service
     const saved = yield* PermissionSaved.Service
     const pending = new Map<ID, Pending>()
+    const deniedRules: Rule[] = []
 
     yield* EffectRuntime.addFinalizer(() =>
       EffectRuntime.forEach(pending.values(), (item) => Deferred.fail(item.deferred, new RejectedError()), {
@@ -179,6 +180,13 @@ export const layer = Layer.effect(
     }
 
     const evaluateInput = EffectRuntime.fnUntraced(function* (input: AssertInput) {
+      // Check denied rules first — previously rejected patterns are auto-denied
+      if (deniedRules.some((rule) =>
+        Wildcard.match(input.action, rule.action) &&
+        input.resources.some((resource) => Wildcard.match(resource, rule.resource))
+      )) {
+        return { effect: "deny" as const, rules: deniedRules }
+      }
       const rules = yield* configured(input.sessionID, input.agent)
       if (denied(input, rules)) return { effect: "deny" as const, rules }
       const all = [...rules, ...(yield* savedRules())]
@@ -254,6 +262,11 @@ export const layer = Layer.effect(
           })
 
           if (input.reply === "reject") {
+            // Record deny rules for all resources so future requests are auto-denied
+            for (const resource of existing.request.resources) {
+              deniedRules.push({ action: existing.request.action, resource, effect: "deny" })
+            }
+
             yield* Deferred.fail(
               existing.deferred,
               input.message ? new CorrectedError({ feedback: input.message }) : new RejectedError(),

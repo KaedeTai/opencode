@@ -133,10 +133,57 @@ export const TelegramCommand = effectCmd({
     // MUST capture the return value to keep registering on the same bot.
     let b = bot
     b = b.on("message", async (ctx: any) => {
-      console.error("[telegram] DEBUG: message event fired, text:", ctx.message?.text)
-      if (!ctx.message?.text || ctx.message.text.startsWith("/") || ctx.message.caption) return
+      const text = ctx.message?.text ?? ctx.message?.caption ?? ""
       const cid = String(ctx.chat.id)
+      if (!text) return
       if (!allow(cid)) return
+
+      // ── Commands ──────────────────────────────────────────────────
+      if (text.startsWith("/")) {
+        const parts = text.slice(1).split(/\s+/)
+        const cmd = parts[0]?.toLowerCase()
+        const args = parts.slice(1)
+
+        if (cmd === "start") {
+          await ctx.reply("👋 Welcome! Send me any request and I'll help you out.\n\nCommands:\n/new - create session\n/abort - stop task\n/status - show session\n/share - get share link\n/help - show help")
+          return
+        }
+        if (cmd === "new") {
+          const sid = await createSession(cid)
+          if (!sid) { await ctx.reply("Failed to create session."); return }
+          await ctx.reply(`✅ New session created: ${sid.slice(0, 8)}...`)
+          return
+        }
+        if (cmd === "abort") {
+          const session = sessions.get(cid)
+          if (!session) { await ctx.reply("No active session."); return }
+          await client.session.abort({ path: { id: session.sessionId } }).catch(() => {})
+          await ctx.reply("✅ Task aborted.")
+          return
+        }
+        if (cmd === "status") {
+          const session = sessions.get(cid)
+          if (!session) { await ctx.reply("No active session. Send /new to create one."); return }
+          await ctx.reply(`📋 Session: \`${session.sessionId}\``, { parse_mode: "Markdown" })
+          return
+        }
+        if (cmd === "share") {
+          const session = sessions.get(cid)
+          if (!session) { await ctx.reply("No active session."); return }
+          const res = await client.session.share({ path: { id: session.sessionId } }).catch(() => null)
+          const url = res?.data?.share?.url ?? `Session ${session.sessionId}`
+          await ctx.reply(`🔗 ${url}`)
+          return
+        }
+        if (cmd === "help") {
+          await ctx.reply("Commands:\n/new - create session\n/abort - stop task\n/status - show session\n/share - get share link\n/help - show this\n\nOr just send any request!")
+          return
+        }
+        // Unknown command — fall through to prompt
+        return
+      }
+
+      // ── Regular prompt ──────────────────────────────────────────────
       safe(async () => {
         let session = sessions.get(cid)
         if (!session) {
@@ -158,14 +205,22 @@ export const TelegramCommand = effectCmd({
 
     // ── Callback query handler ────────────────────────────────────
     b = b.on("callback_query", async (ctx: any) => {
-      console.error("[telegram] DEBUG: callback_query event fired")
-      await ctx.answerCallbackQuery().catch(() => {})
+      console.error("[telegram] DEBUG: callback_query event fired, data:", ctx.callbackQuery?.data)
+      // Telegraf 4.x: answer via ctx.telegram.answerCallbackQuery
+      if (ctx.telegram?.answerCallbackQuery) {
+        await ctx.telegram.answerCallbackQuery(ctx.callbackQuery?.id).catch(() => {})
+      } else if (typeof ctx.answerCallbackQuery === "function") {
+        await ctx.answerCallbackQuery().catch(() => {})
+      } else {
+        console.error("[telegram] answerCallbackQuery not found, ctx keys:", Object.keys(ctx))
+      }
       const data = ctx.callbackQuery?.data
       if (!data || !data.startsWith("perm:")) return
       const parts = data.split(":")
       if (parts.length !== 3) return
       const permissionID = parts[1]
-      const action = parts[2]
+      const action = parts[2] // "allow" or "deny" from button
+      const response = action === "deny" ? "reject" : "once"
       const msg = ctx.callbackQuery.message
       if (!msg) return
       const cid = String(msg.chat.id)
@@ -174,18 +229,23 @@ export const TelegramCommand = effectCmd({
       safe(async () => {
         const res = await client.postSessionIdPermissionsPermissionId({
           path: { id: session.sessionId, permissionID },
-          body: { response: action },
+          body: { response },
         })
         console.error("[telegram] permission response:", JSON.stringify(res))
-        await reply(cid, `✅ Permission ${action}ed.`)
+        if (res.error) {
+          await reply(cid, `❌ Permission error: ${res.error.data?.message ?? "Unknown"}`)
+        } else {
+          await reply(cid, `✅ Permission ${action === "deny" ? "denied" : "allowed"}.`)
+        }
       }, "callback_query handler")
     })
 
     // ── Event stream ──────────────────────────────────────────────
-    console.error("[telegram] starting event stream loop...")
+    console.error("[telegram] starting event stream IIFE...")
     ;(async () => {
       while (true) {
         try {
+          console.error("[telegram] before event.subscribe()")
           const events = await client.event.subscribe()
           console.error("[telegram] event stream connected, waiting...")
           for await (const ev of events.stream) {
@@ -204,20 +264,29 @@ export const TelegramCommand = effectCmd({
               }
 
               // Permission requested — show Allow/Deny buttons
-              if (ev.type === "permission.asked") {
-                const perm = ev.properties as { id: string; sessionID: string; title: string; type: string; pattern?: string | string[] }
+              const evType = ev.type as string
+              if (evType === "permission.v2.asked") {
+                const perm = ev.properties as { id: string; sessionID: string; action: string; resources: string[]; metadata?: Record<string, string> }
+                console.error("[telegram] permission.v2.asked:", JSON.stringify(perm))
                 const cid = chatOf(perm.sessionID)
-                if (!cid) continue
+                if (!cid) {
+                  console.error("[telegram] permission session not found in sessions map, sessionIDs:", [...sessions.values()].map(s => s.sessionId))
+                  continue
+                }
+                console.error("[telegram] sending permission buttons to cid:", cid)
 
-                const pattern = Array.isArray(perm.pattern) ? perm.pattern.join(", ") : (perm.pattern ?? "")
+                const pattern = perm.resources.join(", ")
                 const shortPattern = trunc(pattern, 200)
+                const meta = perm.metadata ?? {}
+                const detail = meta.filepath ?? meta.parentDir ?? ""
 
-                const msg = `🔒 Permission: ${perm.type}\n${perm.title}${shortPattern ? "\n" + shortPattern : ""}`
+                const msg = `🔒 Permission: ${perm.action}${detail ? "\n" + detail : ""}${shortPattern ? "\n" + shortPattern : ""}`
                 const btns = Markup.inlineKeyboard([
                   [Markup.button.callback("✅ Allow", `perm:${perm.id}:allow`)],
                   [Markup.button.callback("❌ Deny", `perm:${perm.id}:deny`)],
                 ])
                 await reply(cid, msg, btns)
+                console.error("[telegram] permission buttons sent")
                 continue
               }
 

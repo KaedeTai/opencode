@@ -10,7 +10,7 @@ const opencode = await createOpencode({
 console.log("✅ Opencode server ready")
 
 // Track active connections and their sessions
-const clients = new Map<Bun.ServerWebSocket<{ id: string }>, { id: string; sessionId: string | null }>()
+const clients = new Map<Bun.ServerWebSocket, { id: string; sessionId: string | null }>()
 
 // Global event subscription — forwards events to all connected clients
 void (async () => {
@@ -36,7 +36,7 @@ const server = Bun.serve({
       req.headers.get("Upgrade") === "websocket" &&
       url.pathname === "/ws"
     ) {
-      const ws = server.upgrade<Bun.ServerWebSocket<{ id: string }>>(req)
+      const ws = server.upgrade(req)
       return
     }
 
@@ -59,6 +59,7 @@ const server = Bun.serve({
   websocket: {
     open(ws) {
       const id = crypto.randomUUID()
+      // @ts-expect-error - Bun type limitation, data is set at runtime
       ws.data = { id }
       clients.set(ws, { id, sessionId: null })
       console.log(`🔗 Client connected: ${id}`)
@@ -95,7 +96,7 @@ const server = Bun.serve({
 
 console.log(`⚡️ WebSocket server is running on ws://localhost:${PORT}/ws`)
 
-async function handleMessage(ws: Bun.ServerWebSocket<{ id: string }>, data: unknown) {
+async function handleMessage(ws: Bun.ServerWebSocket, data: unknown) {
   if (
     typeof data !== "object" ||
     data === null ||
@@ -112,7 +113,7 @@ async function handleMessage(ws: Bun.ServerWebSocket<{ id: string }>, data: unkn
   const { type } = data
 
   if (type === "prompt") {
-    if (!data.text || typeof data.text !== "string") {
+    if (!("text" in data) || typeof data.text !== "string") {
       ws.send(JSON.stringify({
         type: "error",
         message: "Prompt message must include a 'text' field.",
@@ -143,7 +144,7 @@ async function handleMessage(ws: Bun.ServerWebSocket<{ id: string }>, data: unkn
   }))
 }
 
-async function handlePrompt(ws: Bun.ServerWebSocket<{ id: string }>, text: string) {
+async function handlePrompt(ws: Bun.ServerWebSocket, text: string) {
   const clientInfo = clients.get(ws)
   if (!clientInfo) return
 
@@ -171,7 +172,7 @@ async function handlePrompt(ws: Bun.ServerWebSocket<{ id: string }>, text: strin
   console.log("✅ Prompt sent")
 }
 
-async function handleAbort(ws: Bun.ServerWebSocket<{ id: string }>) {
+async function handleAbort(ws: Bun.ServerWebSocket) {
   const clientInfo = clients.get(ws)
   if (!clientInfo || !clientInfo.sessionId) {
     ws.send(JSON.stringify({
@@ -200,7 +201,7 @@ async function handleAbort(ws: Bun.ServerWebSocket<{ id: string }>) {
   console.log(`⏹️ Session ${clientInfo.sessionId} aborted`)
 }
 
-async function handleNewSession(ws: Bun.ServerWebSocket<{ id: string }>) {
+async function handleNewSession(ws: Bun.ServerWebSocket) {
   const clientInfo = clients.get(ws)
   if (!clientInfo) return
 
@@ -210,7 +211,7 @@ async function handleNewSession(ws: Bun.ServerWebSocket<{ id: string }>) {
   console.log(`✅ New session created: ${clientInfo.sessionId}`)
 }
 
-async function doCreateSession(ws: Bun.ServerWebSocket<{ id: string }>): Promise<string | null> {
+async function doCreateSession(ws: Bun.ServerWebSocket): Promise<string | null> {
   const createResult = await opencode.client.session.create({
     body: { title: `WebSocket session ${Date.now()}` },
   })
@@ -243,7 +244,7 @@ async function doCreateSession(ws: Bun.ServerWebSocket<{ id: string }>): Promise
   return sessionId
 }
 
-function sendStatus(ws: Bun.ServerWebSocket<{ id: string }>) {
+function sendStatus(ws: Bun.ServerWebSocket) {
   const clientInfo = clients.get(ws)
   if (!clientInfo) return
 

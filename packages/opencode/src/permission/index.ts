@@ -34,6 +34,7 @@ interface PendingEntry {
 interface State {
   pending: Map<PermissionV1.ID, PendingEntry>
   approved: PermissionV1.Rule[]
+  denied: PermissionV1.Rule[]
 }
 
 export function evaluate(permission: string, pattern: string, ...rulesets: PermissionV1.Ruleset[]): PermissionV1.Rule {
@@ -60,6 +61,7 @@ export const layer = Layer.effect(
         const state = {
           pending: new Map<PermissionV1.ID, PendingEntry>(),
           approved: [],
+          denied: [],
         }
 
         yield* Effect.addFinalizer(() =>
@@ -76,11 +78,18 @@ export const layer = Layer.effect(
     )
 
     const ask = Effect.fn("Permission.ask")(function* (input: PermissionV1.AskInput) {
-      const { approved, pending } = yield* InstanceState.get(state)
+      const { approved, denied, pending } = yield* InstanceState.get(state)
       const { ruleset, ...request } = input
       let needsAsk = false
 
       for (const pattern of request.patterns) {
+        // Check denied rules first — if a previously rejected pattern matches, deny immediately
+        const denyRule = evaluate(request.permission, pattern, denied)
+        if (denyRule.action === "deny") {
+          return yield* new PermissionV1.DeniedError({
+            ruleset: denied.filter((rule) => Wildcard.match(request.permission, rule.permission)),
+          })
+        }
         const rule = evaluate(request.permission, pattern, ruleset, approved)
         yield* Effect.logInfo("evaluated", { permission: request.permission, pattern, action: rule })
         if (rule.action === "deny") {
@@ -118,7 +127,7 @@ export const layer = Layer.effect(
     })
 
     const reply = Effect.fn("Permission.reply")(function* (input: PermissionV1.ReplyInput) {
-      const { approved, pending } = yield* InstanceState.get(state)
+      const { approved, denied, pending } = yield* InstanceState.get(state)
       const existing = pending.get(input.requestID)
       if (!existing) return yield* new PermissionV1.NotFoundError({ requestID: input.requestID })
 
@@ -130,6 +139,11 @@ export const layer = Layer.effect(
       })
 
       if (input.reply === "reject") {
+        // Record deny rules for all patterns so future requests are auto-denied
+        for (const pattern of existing.info.patterns) {
+          denied.push({ permission: existing.info.permission, pattern, action: "deny" })
+        }
+
         yield* Deferred.fail(
           existing.deferred,
           input.message
