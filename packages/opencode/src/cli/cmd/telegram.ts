@@ -285,7 +285,15 @@ export const TelegramCommand = effectCmd({
         })
         console.error("[telegram] permission response:", JSON.stringify(res))
         if (res.error) {
-          await reply(cid, `❌ Permission error: ${res.error.data?.message ?? "Unknown"}`)
+          const err = res.error as { _tag?: string; message?: string }
+          // PermissionNotFoundError means user pressed a button twice or the request
+          // already resolved — not a real error, just ignore silently.
+          if (err._tag === "PermissionNotFoundError") {
+            console.error("[telegram] permission already resolved, ignoring duplicate click")
+            return
+          }
+          const msg = err.message ?? "Unknown error"
+          await reply(cid, `❌ Permission error: ${msg}`)
         } else {
           const label = action === "deny" ? "denied" : action === "always" ? "always allowed" : "allowed"
           await reply(cid, `✅ Permission ${label}.`)
