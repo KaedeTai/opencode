@@ -626,6 +626,7 @@ export const TelegramCommand = effectCmd({
                       s.lastReasoning = null
                       s.userPrompt = null
                       s.streamMsgId = null
+                      stopTyping(cid)
                     } else {
                       // busy / retry — show "typing" indicator
                       startTyping(cid)
