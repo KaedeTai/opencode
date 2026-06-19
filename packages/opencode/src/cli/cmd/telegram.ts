@@ -402,6 +402,25 @@ export const TelegramCommand = effectCmd({
                 continue
               }
 
+              // Session error — notify the user. Without this the bot goes
+              // silent when the model or a tool fails, and the user has no
+              // way to tell that anything went wrong.
+              if (ev.type === "session.error") {
+                const err = ev.properties as {
+                  sessionID?: string
+                  error?: { name?: string; message?: string; data?: { message?: string } }
+                }
+                console.error("[telegram] session.error:", JSON.stringify(err))
+                const sid = err.sessionID
+                if (!sid) continue
+                const cid = chatOf(sid)
+                if (!cid) continue
+                const name = err.error?.name ?? "Error"
+                const message = err.error?.data?.message ?? err.error?.message ?? "Unknown error"
+                await reply(cid, `❌ ${name}: ${trunc(message, 3500)}`)
+                continue
+              }
+
               // Permission requested — show Allow/Deny buttons
               const evType = ev.type as string
               if (evType === "permission.asked") {
@@ -510,6 +529,22 @@ export const TelegramCommand = effectCmd({
                 if (p.state.status === "completed" && p.state.title) {
                   send(cid, `🔧 ${p.tool}: ${p.state.title}`)
                 }
+              } else if (part.type === "patch") {
+                // Patch part summarizes file-level changes for the whole
+                // assistant turn. The full diff is too large for Telegram
+                // (4096 char limit) and would duplicate the tool messages
+                // emitted per edit, so just show a per-file +/- count.
+                const p = part as unknown as {
+                  hash: string
+                  files: Array<{ path: string; additions?: number; deletions?: number }>
+                }
+                if (!p.files?.length) continue
+                const lines = p.files.map((f) => {
+                  const add = f.additions ?? 0
+                  const del = f.deletions ?? 0
+                  return `  ${f.path}  +${add} -${del}`
+                })
+                send(cid, `📝 ${p.files.length} file${p.files.length === 1 ? "" : "s"} changed:\n${lines.join("\n")}`)
               }
             } catch (evErr: any) {
               console.error("[telegram] event loop inner error:", evErr?.message ?? evErr)
