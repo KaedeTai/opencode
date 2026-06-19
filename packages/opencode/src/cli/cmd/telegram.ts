@@ -139,7 +139,12 @@ export const TelegramCommand = effectCmd({
     // also rejects no-op edits).
     async function editOrSend(s: SessionState, cid: string, text: string) {
       if (!text || !text.trim()) return
-      const body = trunc(text, 4000)
+      // Models occasionally emit literal "undefined" tokens when they
+      // guess a field that wasn't in the tool result (e.g. "1 file
+      // changed: undefined +0 -0"). Strip bare undefineds — they only
+      // ever look like broken placeholders, never like intentional text.
+      const cleaned = text.replace(/\bundefined\b/g, "")
+      const body = trunc(cleaned, 4000)
       if (s.streamMsgId == null) {
         try {
           const m = await bot.telegram.sendMessage(cid, body)
