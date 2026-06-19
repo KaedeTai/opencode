@@ -96,6 +96,35 @@ export const TelegramCommand = effectCmd({
       }
     }
 
+    // Send a question answer to the server via the v2 REST endpoint
+    // (v1 SDK has no question API; v2 has client.question.reply but importing
+    // both SDKs is overkill — just fetch directly.)
+    async function answerQuestion(
+      cid: string,
+      questionID: string,
+      answers: string[],
+      sessionID: string,
+    ) {
+      try {
+        const res = await fetch(`${server.url}/question/${questionID}/reply`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "x-opencode-directory": encodeURIComponent(process.cwd()) },
+          body: JSON.stringify({ answers }),
+        })
+        console.error("[telegram] question reply status:", res.status)
+        if (!res.ok) {
+          const text = await res.text().catch(() => "")
+          await reply(cid, `❌ Question reply failed (${res.status}): ${text.slice(0, 200)}`)
+        } else {
+          pendingCustomQuestion.delete(cid)
+          await reply(cid, "✅ Answer sent.")
+        }
+      } catch (e: any) {
+        console.error("[telegram] question reply error:", e?.message ?? e)
+        await reply(cid, `❌ Question reply error: ${e?.message ?? e}`)
+      }
+    }
+
     function chatOf(sessionId: string): string | null {
       for (const [cid, s] of sessions.entries()) {
         if (s.sessionId === sessionId) return cid
@@ -131,6 +160,10 @@ export const TelegramCommand = effectCmd({
     // ── Session map (with JSON persistence) ───────────────────────
     const SESSIONS_FILE = path.join(Global.Path.data, "telegram-sessions.json")
     const sessions = new Map<string, { sessionId: string; lastSent: string | null; lastReasoning: string | null; userPrompt: string | null }>()
+    // Track pending questions so callback buttons can resolve label from index
+    const pendingQuestions = new Map<string, { sessionID: string; options: Array<{ label: string; description: string }> }>()
+    // Track which question each chat is currently waiting for a custom answer on
+    const pendingCustomQuestion = new Map<string, string>()
 
     // Load existing sessions on startup (only if file exists)
     const sessionsFileExists = yield* Effect.promise(() => Bun.file(SESSIONS_FILE).exists())
@@ -180,6 +213,19 @@ export const TelegramCommand = effectCmd({
           console.error("[telegram] group message without mention, ignoring")
           return
         }
+      }
+
+      // ── Custom answer to a pending question ──────────────────────
+      const pendingQID = pendingCustomQuestion.get(cid)
+      if (pendingQID && !text.startsWith("/")) {
+        const pending = pendingQuestions.get(pendingQID)
+        if (pending) {
+          await answerQuestion(cid, pendingQID, [text], pending.sessionID)
+          pendingQuestions.delete(pendingQID)
+        } else {
+          pendingCustomQuestion.delete(cid)
+        }
+        return
       }
 
       // ── Commands ──────────────────────────────────────────────────
@@ -263,12 +309,7 @@ export const TelegramCommand = effectCmd({
         console.error("[telegram] answerCallbackQuery not found, ctx keys:", Object.keys(ctx))
       }
       const data = ctx.callbackQuery?.data
-      if (!data || !data.startsWith("perm:")) return
-      const parts = data.split(":")
-      if (parts.length !== 3) return
-      const permissionID = parts[1]
-      const action = parts[2] // "allow" | "deny" | "always"
-      const response: "once" | "always" | "reject" = action === "deny" ? "reject" : action === "always" ? "always" : "once"
+      if (!data) return
       const msg = ctx.callbackQuery.message
       if (!msg) return
       const cid = String(msg.chat.id)
@@ -277,6 +318,43 @@ export const TelegramCommand = effectCmd({
         return
       }
       const session = sessions.get(cid)
+
+      // ── Question answer ───────────────────────────────────────────
+      if (data.startsWith("ques:")) {
+        const parts = data.split(":")
+        // Format: ques:<questionID>:<optionIndex | "custom">
+        if (parts.length !== 3) return
+        const questionID = parts[1]
+        const answer = parts[2]
+        if (answer === "custom") {
+          // Set pending state — next text message will be the answer
+          pendingCustomQuestion.set(cid, questionID)
+          await reply(cid, "✏️ Please type your answer:")
+          return
+        }
+        // Option button — look up the label from stored question
+        const pending = pendingQuestions.get(questionID)
+        if (!pending) {
+          await reply(cid, "❌ Question expired, please resend your prompt.")
+          return
+        }
+        const optionIndex = parseInt(answer, 10)
+        if (isNaN(optionIndex) || optionIndex < 0 || optionIndex >= pending.options.length) {
+          await reply(cid, "❌ Invalid option.")
+          return
+        }
+        const label = pending.options[optionIndex].label
+        await answerQuestion(cid, questionID, [label], pending.sessionID)
+        pendingQuestions.delete(questionID)
+        return
+      }
+
+      if (!data.startsWith("perm:")) return
+      const parts = data.split(":")
+      if (parts.length !== 3) return
+      const permissionID = parts[1]
+      const action = parts[2] // "allow" | "deny" | "always"
+      const response: "once" | "always" | "reject" = action === "deny" ? "reject" : action === "always" ? "always" : "once"
       if (!session) return
       safe(async () => {
         const res = await client.postSessionIdPermissionsPermissionId({
@@ -355,6 +433,43 @@ export const TelegramCommand = effectCmd({
                 ])
                 await reply(cid, msg, btns)
                 console.error("[telegram] permission buttons sent")
+                continue
+              }
+
+              // Question asked — show options as buttons
+              if (evType === "question.asked") {
+                const q = ev.properties as {
+                  id: string
+                  sessionID: string
+                  questions: Array<{
+                    question: string
+                    header: string
+                    options: Array<{ label: string; description: string }>
+                  }>
+                }
+                console.error("[telegram] question.asked:", JSON.stringify(q))
+                const cid = chatOf(q.sessionID)
+                if (!cid) {
+                  console.error("[telegram] question session not found")
+                  continue
+                }
+                for (const question of q.questions) {
+                  // Store for label lookup on button press
+                  pendingQuestions.set(q.id, { sessionID: q.sessionID, options: question.options })
+                  const head = question.header ? `[${question.header}]\n` : ""
+                  const text = `❓ ${head}${question.question}`
+                  // Build one button row per option
+                  const rows = question.options.map((opt, i) => [
+                    Markup.button.callback(opt.label, `ques:${q.id}:${i}`),
+                  ])
+                  // Add a custom answer button if there are no options or tool allows it
+                  if (question.options.length === 0) {
+                    rows.push([Markup.button.callback("✏️ Custom answer", `ques:${q.id}:custom`)])
+                  }
+                  const btns = Markup.inlineKeyboard(rows)
+                  await reply(cid, text, btns)
+                  console.error("[telegram] question buttons sent for", question.header)
+                }
                 continue
               }
 
