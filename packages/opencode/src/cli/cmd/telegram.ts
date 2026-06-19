@@ -211,6 +211,86 @@ export const TelegramCommand = effectCmd({
       }
     }
 
+    // ── Media: download from Telegram + transcribe voice ─────────
+    // Whisper runs locally on Metal for voice transcription. Path is
+    // overridable so the same binary works on Linux (CPU whisper.cpp)
+    // or with a custom model size.
+    const WHISPER_BIN = process.env.WHISPER_BIN ?? "/opt/homebrew/bin/whisper-cli"
+    const WHISPER_MODEL = process.env.WHISPER_MODEL ?? path.join(Global.Path.home, "models", "whisper", "ggml-large-v3-turbo.bin")
+
+    // Download a Telegram file by its file_id and return its raw bytes
+    // plus a best-guess filename. Telegram's getFile returns a
+    // file_path on the CDN which we can GET directly.
+    async function downloadTelegramFile(fileId: string, fallbackName: string, fallbackMime: string): Promise<{ buffer: Uint8Array; filename: string; mime: string }> {
+      const link = await bot.telegram.getFileLink(fileId)
+      const res = await fetch(link.toString())
+      if (!res.ok) throw new Error(`telegram download failed: ${res.status}`)
+      const ab = await res.arrayBuffer()
+      const mime = res.headers.get("content-type") ?? fallbackMime
+      const filename = link.toString().split("/").pop() ?? fallbackName
+      return { buffer: new Uint8Array(ab), filename, mime }
+    }
+
+    // Voice messages go through whisper.cpp to text. We don't ship the
+    // audio to the model — speech-as-text is just a richer text prompt.
+    async function transcribeAudio(buffer: Uint8Array, ext = "ogg"): Promise<string> {
+      if (!(await Bun.file(WHISPER_BIN).exists())) {
+        throw new Error(`whisper-cli not found at ${WHISPER_BIN} (set WHISPER_BIN env var to override)`)
+      }
+      if (!(await Bun.file(WHISPER_MODEL).exists())) {
+        throw new Error(`whisper model not found at ${WHISPER_MODEL} (set WHISPER_MODEL env var to override)`)
+      }
+      const tmp = path.join(Global.Path.data, `voice-${Date.now()}.${ext}`)
+      try {
+        await Bun.write(tmp, buffer)
+        // -np = no progress, -otxt - = plain text to stdout. whisper-cli
+        // writes some ggml init spam to stderr but transcription goes to
+        // stdout, so 2>/dev/null gives us a clean string.
+        const proc = Bun.spawn(
+          [WHISPER_BIN, "-m", WHISPER_MODEL, "-f", tmp, "--no-timestamps", "-np", "-otxt", "-"],
+          { stderr: "ignore" },
+        )
+        const text = (await new Response(proc.stdout).text()).trim()
+        const code = await proc.exited
+        if (code !== 0) throw new Error(`whisper-cli exited ${code}`)
+        return text
+      } finally {
+        // Best-effort cleanup of the temp file. Audio data may be
+        // sensitive (e.g. dictation of private notes), so don't leave
+        // it lying around.
+        await Bun.$`rm -f ${tmp}`.quiet().nothrow()
+      }
+    }
+
+    // Send a prompt with arbitrary parts (text + file attachments) to
+    // the active session, creating one if needed. userPromptForEcho is
+    // the text we'll use to match/dedupe the assistant's first chunk
+    // so it doesn't get filtered as a user-prompt echo. For voice
+    // prompts this is the transcribed text; for media without caption
+    // we pass a synthetic label like "[image]" / "[voice]".
+    async function dispatchPrompt(
+      cid: string,
+      parts: Array<Record<string, any>>,
+      userPromptForEcho: string,
+    ) {
+      let session = sessions.get(cid)
+      if (!session) {
+        const sid = await createSession(cid)
+        if (!sid) return { error: "Failed to create session." as const }
+        session = sessions.get(cid)
+        if (!session) return { error: "Failed to create session." as const }
+      }
+      session.userPrompt = userPromptForEcho
+      const result = await client.session.promptAsync({
+        path: { id: session.sessionId },
+        body: { parts: parts as any },
+      })
+      if (result.error) {
+        return { error: result.error.data?.message ?? "Failed" as const }
+      }
+      return { ok: true as const }
+    }
+
     async function reply(cid: string, msg: string, extras?: any) {
       try {
         await bot.telegram.sendMessage(cid, msg, extras)
@@ -270,10 +350,8 @@ export const TelegramCommand = effectCmd({
 
     // ── Message handler ────────────────────────────────────────────
     bot.on("message", async (ctx: any) => {
-      const text = ctx.message?.text ?? ctx.message?.caption ?? ""
       const cid = String(ctx.chat.id)
-      console.error("[telegram] message from", cid, "type:", ctx.chat.type, ":", JSON.stringify(text.slice(0, 80)))
-      if (!text) return
+      console.error("[telegram] message from", cid, "type:", ctx.chat.type, "subtype:", Object.keys(ctx.message ?? {}).filter((k) => !["date", "chat", "from", "message_id"].includes(k)).join(","))
       if (!allow(cid)) {
         console.error("[telegram] chat", cid, "not in allowlist, ignoring")
         return
@@ -282,12 +360,91 @@ export const TelegramCommand = effectCmd({
       if (ctx.chat.type !== "private") {
         const me = await ctx.telegram.getMe().catch(() => null)
         const username = me?.username ? `@${me.username}` : ""
-        const isCommand = text.startsWith("/")
-        if (!isCommand && username && !text.includes(username)) {
+        const isCommand = (ctx.message?.text ?? "").startsWith("/")
+        if (!isCommand && username && !(ctx.message?.text ?? "").includes(username)) {
           console.error("[telegram] group message without mention, ignoring")
           return
         }
       }
+
+      // ── Media: photo / voice / document ──────────────────────────
+      // Each branch is self-contained: downloads the file, builds the
+      // prompt parts, dispatches. Voice takes a transcription detour.
+      const text = ctx.message?.text ?? ctx.message?.caption ?? ""
+
+      if (ctx.message?.photo) {
+        safe(async () => {
+          const photos = ctx.message.photo as Array<{ file_id: string; width: number; height: number; file_size?: number }>
+          // Telegram gives us a thumbnail ladder; pick the largest.
+          const best = photos[photos.length - 1]
+          const dl = await downloadTelegramFile(best.file_id, "photo.jpg", "image/jpeg")
+          if (dl.buffer.byteLength > 6 * 1024 * 1024) {
+            await reply(cid, "❌ Image too large (>6MB after base64 encoding). Send a smaller one.")
+            return
+          }
+          const b64 = Buffer.from(dl.buffer).toString("base64")
+          const dataUri = `data:image/jpeg;base64,${b64}`
+          const caption = text || "[image]"
+          const res = await dispatchPrompt(
+            cid,
+            [
+              { type: "text", text: caption },
+              { type: "file", mime: "image/jpeg", url: dataUri, filename: dl.filename },
+            ],
+            caption,
+          )
+          if (res?.error) await reply(cid, `Error: ${res.error}`)
+        }, "photo handler")
+        return
+      }
+
+      if (ctx.message?.voice || ctx.message?.audio) {
+        const v = (ctx.message.voice ?? ctx.message.audio) as { file_id: string; mime_type?: string; duration: number; file_size?: number }
+        safe(async () => {
+          if (v.duration > 120) {
+            await reply(cid, "❌ Voice message too long (>120s). Keep it under 2 minutes.")
+            return
+          }
+          await reply(cid, "🎤 Transcribing…")
+          const dl = await downloadTelegramFile(v.file_id, "voice.ogg", v.mime_type ?? "audio/ogg")
+          const transcribed = await transcribeAudio(dl.buffer, "ogg")
+          if (!transcribed) {
+            await reply(cid, "❌ Could not transcribe audio (empty result).")
+            return
+          }
+          await reply(cid, `📝 Heard: "${trunc(transcribed, 200)}"`)
+          const finalText = text ? `${text}\n\n[voice] ${transcribed}` : transcribed
+          const res = await dispatchPrompt(cid, [{ type: "text", text: finalText }], finalText)
+          if (res?.error) await reply(cid, `Error: ${res.error}`)
+        }, "voice handler")
+        return
+      }
+
+      if (ctx.message?.document) {
+        const d = ctx.message.document as { file_id: string; file_name?: string; mime_type?: string; file_size?: number }
+        safe(async () => {
+          if (d.file_size && d.file_size > 20 * 1024 * 1024) {
+            await reply(cid, "❌ Document too large (>20MB). Send a smaller one.")
+            return
+          }
+          const dl = await downloadTelegramFile(d.file_id, d.file_name ?? "document", d.mime_type ?? "application/octet-stream")
+          const b64 = Buffer.from(dl.buffer).toString("base64")
+          const dataUri = `data:${dl.mime};base64,${b64}`
+          const caption = text || `[file] ${dl.filename}`
+          const res = await dispatchPrompt(
+            cid,
+            [
+              { type: "text", text: caption },
+              { type: "file", mime: dl.mime, url: dataUri, filename: dl.filename },
+            ],
+            caption,
+          )
+          if (res?.error) await reply(cid, `Error: ${res.error}`)
+        }, "document handler")
+        return
+      }
+
+      if (!text) return
 
       // ── Custom answer to a pending question ──────────────────────
       const pendingQID = pendingCustomQuestion.get(cid)
@@ -358,21 +515,8 @@ export const TelegramCommand = effectCmd({
 
       // ── Regular prompt ──────────────────────────────────────────────
       safe(async () => {
-        let session = sessions.get(cid)
-        if (!session) {
-          const sid = await createSession(cid)
-          if (!sid) { await ctx.reply("Failed to create session."); return }
-          session = sessions.get(cid)
-          if (!session) return
-        }
-        session.userPrompt = ctx.message.text
-        const result = await client.session.promptAsync({
-          path: { id: session.sessionId },
-          body: { parts: [{ type: "text", text: ctx.message.text }] },
-        })
-        if (result.error) {
-          await ctx.reply(`Error: ${result.error.data?.message ?? "Failed"}`)
-        }
+        const res = await dispatchPrompt(cid, [{ type: "text", text }], text)
+        if (res?.error) await reply(cid, `Error: ${res.error}`)
       }, "message handler")
     })
 
