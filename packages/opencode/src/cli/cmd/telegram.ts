@@ -413,16 +413,15 @@ export const TelegramCommand = effectCmd({
         const row = db
           .query<{
             tokens: string
-            model: string
-            provider: string
           }, [string]>(
-            `SELECT data, providerID, modelID
+            `SELECT data
                FROM message
               WHERE session_id = ? AND data LIKE '%"role":"assistant"%'
               ORDER BY time_created DESC
               LIMIT 1`,
           )
           .get(sessionID)
+        console.error("[telegram] getSessionTokens: sessionID=", sessionID, "dbPath=", dbPath, "row=", row ? "found" : "null")
         if (!row) return null
         const msg = JSON.parse(row.tokens) as {
           tokens?: {
