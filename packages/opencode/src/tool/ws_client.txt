@@ -47,9 +47,12 @@ Usage notes:
   To pick a model on the peer, edit the peer's
   `~/.config/opencode/opencode.jsonc` `model` / `provider`
   fields or use the peer's `/model` command.
-- Connection and prompt are subject to a `timeout` (default
-  60s, max 5 minutes). Long-running tasks should use
-  `detached: true` instead of bumping the timeout.
+- Sync mode is the default and recommended: the tool
+  blocks until the peer goes idle (or `timeout` fires,
+  default 60s, max 5 min). One tool call = one round trip
+  = one answer to reason about. Don't reach for `detached`
+  unless you specifically need to start a task and
+  continue with other work in the same turn.
 - `detached: true` returns a `task_id` and a `resultFile`
   path immediately. The job runs in-process via the
   opencode BackgroundJob registry — fetch the result
