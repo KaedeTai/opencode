@@ -41,30 +41,29 @@ if (WS_SMOKE) {
       // Spawn the bridge in a temp dir.
       const tempDir = await fs.mkdtemp(`${import.meta.dir}/.ws-smoke-`)
       const entry = path.resolve(process.cwd(), "src/index.ts")
-      const bridge = spawn({
-        cmd: [
-          "bun",
-          "run",
-          "--conditions=browser",
-          entry,
-          "websocket",
-          "--ws-port",
-          String(port),
-          "--hostname",
-          "127.0.0.1",
-        ],
-        env: {
-          ...process.env,
-          OPENCODE_PRINT_LOGS: "1",
-          ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY ?? "",
-          ANTHROPIC_BASE_URL: process.env.ANTHROPIC_BASE_URL ?? "",
-          OPENCODE_DEFAULT_MODEL:
-            process.env.OPENCODE_DEFAULT_MODEL ?? "anthropic/MiniMax-M3",
-        },
-        cwd: tempDir,
-        stdout: "pipe",
-        stderr: "pipe",
-      })
+  const bridge = spawn({
+    cmd: [
+      "bun",
+      "run",
+      "--conditions=browser",
+      entry,
+      "websocket",
+      "--ws-port",
+      String(port),
+      "--hostname",
+      "127.0.0.1",
+    ],
+    // Config-driven: the bridge reads its model from
+    // ~/.config/opencode/opencode.json. Tests assume
+    // "model" and "small_model" are set there.
+    env: {
+      ...process.env,
+      OPENCODE_PRINT_LOGS: "1",
+    },
+    cwd: tempDir,
+    stdout: "pipe",
+    stderr: "pipe",
+  })
       void readStream(bridge.stdout as ReadableStream<Uint8Array> | undefined, "[bridge]")
       void readStream(bridge.stderr as ReadableStream<Uint8Array> | undefined, "[bridge]")
 

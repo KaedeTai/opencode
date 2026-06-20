@@ -9,6 +9,19 @@
 // Run from packages/opencode:
 //   bun run scripts/ws-demo.ts
 //
+// The bridge is config-driven: it reads its default model,
+// provider, and permission rules from `~/.config/opencode/opencode.json`.
+// No env-var monkey-patching here — set the model in your
+// config (see TELEGRAM-INTEGRATION.md for the pattern).
+//
+// Required config in ~/.config/opencode/opencode.json:
+//
+//   {
+//     "provider": { "omlx": { ... } },     // or any provider
+//     "model": "omlx/Qwen3.6-27B-UD-MLX-4bit",
+//     "small_model": "omlx/Qwen3.6-27B-UD-MLX-4bit"
+//   }
+//
 // The bridge's stdout/stderr stream through so you can see
 // what the remote opencode is doing.
 
@@ -37,12 +50,12 @@ const bridge: Subprocess = spawn({
     "--hostname",
     "127.0.0.1",
   ],
+  // No env-var model override. The bridge reads its model
+  // from ~/.config/opencode/opencode.json — set "model" and
+  // "small_model" there.
   env: {
     ...process.env,
     OPENCODE_PRINT_LOGS: "1",
-    OPENCODE_DEFAULT_MODEL: process.env.OPENCODE_DEFAULT_MODEL ?? "anthropic/MiniMax-M3",
-    ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY ?? "",
-    ANTHROPIC_BASE_URL: process.env.ANTHROPIC_BASE_URL ?? "",
   },
   cwd: tempDir,
   stdout: "pipe",
