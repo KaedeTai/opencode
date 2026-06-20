@@ -743,8 +743,14 @@ export const TelegramCommand = effectCmd({
         const cmd = parts[0]?.toLowerCase()
         const args = parts.slice(1)
 
+        if (cmd === "restart") {
+          await ctx.reply("🔄 Restarting...")
+          // Exit with 143 (SIGTERM) so the restart loop picks it up
+          setTimeout(() => process.exit(143), 100)
+          return
+        }
         if (cmd === "start") {
-          await ctx.reply("👋 Welcome! Send me any request and I'll help you out.\n\nCommands:\n/new - create session\n/abort - stop task\n/status - show session\n/share - get share link\n/model - show or switch model\n/compact - summarize this session\n/fork - fork at last user message\n/retry - resend last prompt\n/sessions - list & switch sessions\n/whoami - show your chat ID\n/help - show this")
+          await ctx.reply("👋 Welcome! Send me any request and I'll help you out.\n\nCommands:\n/new - create session\n/abort - stop task\n/status - show session\n/share - get share link\n/model - show or switch model\n/compact - summarize this session\n/fork - fork at last user message\n/retry - resend last prompt\n/restart - restart bot\n/sessions - list & switch sessions\n/whoami - show your chat ID\n/help - show this")
           return
         }
         if (cmd === "new") {
@@ -909,7 +915,7 @@ export const TelegramCommand = effectCmd({
           return
         }
         if (cmd === "help") {
-          await ctx.reply("Commands:\n/new - new session (active)\n/abort - stop task\n/status - show session\n/share - get share link\n/model [query] - show or switch model\n/compact - summarize this session\n/fork - fork at last user message\n/retry - resend last prompt\n/sessions - list & switch sessions\n/to <id> <msg> - send a message to a specific session\n/whoami - show your chat ID\n/help - show this\n\nOr just send any request!")
+          await ctx.reply("Commands:\n/new - new session (active)\n/abort - stop task\n/status - show session\n/share - get share link\n/model [query] - show or switch model\n/compact - summarize this session\n/fork - fork at last user message\n/retry - resend last prompt\n/restart - restart bot\n/sessions - list & switch sessions\n/to <id> <msg> - send a message to a specific session\n/whoami - show your chat ID\n/help - show this\n\nOr just send any request!")
           return
         }
         if (cmd === "whoami") {
