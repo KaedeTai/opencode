@@ -16,9 +16,7 @@ export type ModelEntry = {
 // catalog (built from the server) is the primary source.
 const STATIC_FALLBACK: ModelEntry[] = [
   { providerID: "omlx", modelID: "Qwen3.6-35B-A3B-Claude-4.7-Opus-Reasoning-Distilled-MLX-oQ4-MTP", name: "oMLX · Qwen 3.6 35B", contextLimit: null },
-  { providerID: "anthropic", modelID: "MiniMax-M3", name: "MiniMax · MiniMax-M3 (1M ctx, via anthropic route)", contextLimit: 1_000_000 },
-  { providerID: "anthropic", modelID: "MiniMax-M2.7-highspeed", name: "MiniMax · MiniMax-M2.7 highspeed", contextLimit: 204_800 },
-  { providerID: "anthropic", modelID: "MiniMax-M2.7", name: "MiniMax · MiniMax-M2.7 (200K ctx)", contextLimit: 204_800 },
+  { providerID: "minimax-cn", modelID: "MiniMax-M3", name: "minimax-cn · MiniMax-M3", contextLimit: 1_000_000 },
 ]
 
 // Per-model context limit overrides for the static fallback. The
@@ -46,11 +44,21 @@ export function staticContextLimit(modelID: string): number | null {
   return STATIC_CONTEXT_LIMITS[modelID] ?? null
 }
 
+// Provider IDs the bot will surface in /model and use to resolve /status
+// context limits. Anything else (built-in `anthropic`, `opencode`, etc.)
+// is filtered out at the catalog layer so the inline keyboard stays
+// short and the bot never accidentally routes to a provider the user
+// hasn't explicitly opted into. Edit this list to expose more.
+export const ALLOWED_PROVIDER_IDS = new Set(["omlx", "minimax-cn"])
+
 // Build the model catalog from the server's /config/providers endpoint.
 // Returns the dynamic catalog on success, or the static fallback if
 // the server is unreachable. The dynamic catalog is preferred because
 // it carries accurate context limits and reflects the user's current
 // opencode.json + env configuration.
+//
+// Providers are filtered to ALLOWED_PROVIDER_IDS so the user only sees
+// models from providers they actually configured.
 export async function getModelCatalog(client: OpencodeClient): Promise<ModelEntry[]> {
   try {
     const res = await client.config.providers()
@@ -60,6 +68,7 @@ export async function getModelCatalog(client: OpencodeClient): Promise<ModelEntr
       id: string
       models: Record<string, { id?: string; name: string; limit?: { context?: number } }>
     }>) {
+      if (!ALLOWED_PROVIDER_IDS.has(provider.id)) continue
       for (const [modelKey, model] of Object.entries(provider.models)) {
         entries.push({
           providerID: provider.id,
