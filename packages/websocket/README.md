@@ -1,5 +1,22 @@
 # @opencode-ai/websocket
 
+> **Deprecated.** This standalone sidecar is superseded by the
+> built-in `opencode websocket` command. Run that instead:
+>
+> ```bash
+> opencode websocket --port 9999
+> ```
+>
+> The CLI command covers the same protocol (with multi-session,
+> permission/question event forwarding, and event-stream reconnect
+> on top) and is wired into the same release pipeline as the rest
+> of the CLI.
+>
+> This package is kept for one release as a fallback for users
+> who run the bridge outside the opencode binary. New installs
+> should use the CLI command. The package will be removed in the
+> next major.
+
 Part of the [OpenCode](https://opencode.ai) project — see the
 [repo root README](../../README.md), [CONTRIBUTING.md](../../CONTRIBUTING.md),
 and [LICENSE](../../LICENSE).
@@ -8,10 +25,6 @@ Standalone WebSocket bridge for opencode. Runs a separate Bun server that
 wraps the opencode SDK and forwards every event over a WebSocket connection,
 so clients that can't or don't want to use SSE (browsers, mobile apps,
 desktop frontends) can drive an opencode session in real time.
-
-This package is **not** loaded by the `opencode` CLI. Run it as a sidecar
-when you need a WS interface; otherwise the CLI's built-in SSE stream
-(`GET /event`) is the default.
 
 ## Run
 
