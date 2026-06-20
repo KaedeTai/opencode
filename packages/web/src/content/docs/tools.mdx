@@ -252,6 +252,25 @@ Allows the LLM to fetch and read web pages. Useful for looking up documentation 
 
 ---
 
+### ws_client
+
+Send a prompt to a peer opencode instance over WebSocket and return the assistant's response.
+
+```json title="opencode.json" {4}
+{
+  "$schema": "https://opencode.ai/config.json",
+  "permission": {
+    "ws_client": "allow"
+  }
+}
+```
+
+The peer must be reachable at the given `url` and have `opencode websocket` running. The tool collects the assistant's streamed text along with one-line summaries of any tool calls, patches, or reasoning the peer produced. Localhost URLs (including the `ws://127.0.0.1:*` and `ws://[::1]:*` ranges) are auto-allowed; every other host goes through the normal permission gate.
+
+Use this to delegate sub-tasks to another opencode (e.g. one running a different model, in a different project, or in an isolated sandbox) and stitch the result back into the current session. See the [`opencode websocket` command](/docs/cli#websocket) for setting up the peer.
+
+---
+
 ### websearch
 
 Search the web for information.

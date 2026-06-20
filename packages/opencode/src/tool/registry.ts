@@ -13,6 +13,7 @@ import { TaskTool } from "./task"
 import { Database } from "@opencode-ai/core/database/database"
 import { TodoWriteTool } from "./todo"
 import { WebFetchTool } from "./webfetch"
+import { WsClientTool } from "./ws_client"
 import { WriteTool } from "./write"
 import { InvalidTool } from "./invalid"
 import { SkillTool } from "./skill"
@@ -97,6 +98,7 @@ export const layer = Layer.effect(
     const lsptool = yield* LspTool
     const plan = yield* PlanExitTool
     const webfetch = yield* WebFetchTool
+    const wsclient = yield* WsClientTool
     const websearch = yield* WebSearchTool
     const shell = yield* ShellTool
     const globtool = yield* GlobTool
@@ -205,6 +207,7 @@ export const layer = Layer.effect(
           write: Tool.init(writetool),
           task: Tool.init(task),
           fetch: Tool.init(webfetch),
+          ws: Tool.init(wsclient),
           todo: Tool.init(todo),
           search: Tool.init(websearch),
           skill: Tool.init(skilltool),
@@ -227,6 +230,7 @@ export const layer = Layer.effect(
             tool.write,
             tool.task,
             tool.fetch,
+            tool.ws,
             tool.todo,
             tool.search,
             tool.skill,
