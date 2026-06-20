@@ -112,6 +112,27 @@ This is used internally and can be invoked using `@general` in messages.
 
 Learn more about [agents](https://opencode.ai/docs/agents).
 
+### Chat interfaces
+
+OpenCode ships with several frontends on top of the same headless server.
+
+- **TUI** — `opencode` (default). Terminal UI with multiline editing, autocomplete, themes.
+- **Web** — `opencode web`. Browser UI at `http://localhost:<port>`.
+- **Telegram** — `opencode telegram`. Drive sessions from a Telegram chat. Voice messages are transcribed locally via whisper.cpp; photos are sent to vision-capable models. See [TELEGRAM-INTEGRATION.md](./TELEGRAM-INTEGRATION.md).
+- **ACP / IDE** — `opencode acp`. Wire opencode into Zed, VS Code, or any ACP-compatible editor.
+- **Slack** — `packages/slack/`. Standalone Slack bridge.
+
+```bash
+# Telegram bot (set TELEGRAM_BOT_TOKEN, then run)
+opencode telegram
+
+# Web UI
+opencode web
+
+# Just the headless server (for custom frontends)
+opencode serve
+```
+
 ### Documentation
 
 For more info on how to configure OpenCode, [**head over to our docs**](https://opencode.ai/docs).

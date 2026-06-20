@@ -1,93 +1,117 @@
 # Opencode Telegram Integration
 
-将 Telegram bot 作为 opencode CLI 的内置 subcommand 集成。
+Telegram bot built into the opencode CLI. Runs the opencode server
+in-process and connects a Telegraf bot to it, so any chat can drive
+an opencode session over messaging.
 
-## 使用方式
+## Usage
 
 ```bash
-# 使用前
+# Required: bot token from @BotFather
 export TELEGRAM_BOT_TOKEN='your-bot-token'
-export TELEGRAM_ALLOWED_USERS='123456789,987654321'  # 可选
+# Optional: comma-separated chat IDs. Empty = allow any chat.
+export TELEGRAM_ALLOWED_USERS='123456789,987654321'
+
 opencode telegram
-
-# 或指定选项
-opencode telegram --token 'xxx' --allowed-users '123,456'
-
-# 别称
-opencode tg --token 'xxx'
+# or
+opencode tg --token 'xxx' --allowed-users '123,456'
 ```
 
-## 修改的文件
-
-### 1. `packages/opencode/src/cli/cmd/telegram.ts` (新建)
-
-Telegram CLI 命令实现，包含：
-- yargs 命令定义
-- 启动 opencode 服务器
-- 创建 Telegraf bot
-- 命令处理 (`/start`, `/new`, `/abort`, `/status`, `/share`, `/help`)
-- 文字消息处理（自动创建 session + 发送 prompt）
-- SSE 事件订阅（将 AI 回复、工具结果推送到 Telegram）
-
-### 2. `packages/opencode/package.json`
-
-添加 `telegraf` 依赖：
-```diff
-+ "telegraf": "^4.16.3",
-```
-
-### 3. `packages/opencode/src/index.ts`
-
-注册 Telegram 命令：
-```diff
-+ import { TelegramCommand } from "./cli/cmd/telegram"
-  // ...
-- .command(DbCommand)
-+ .command(DbCommand)
-+ .command(TelegramCommand)
-  .fail(
-```
-
-## 环境变量
-
-| 变量 | CLI 选项 | 说明 |
-|------|----------|------|
-| `TELEGRAM_BOT_TOKEN` | `--token` | Telegram bot token（必须设其中一个） |
-| `TELEGRAM_ALLOWED_USERS` | `--allowed-users` | 允许的 chat ID，逗号分隔，留空=允许所有 |
-
-## 技术架构
+## Files
 
 ```
-opencode telegram
-    │
-    ├─ Server.listen(opts)     # 启动 opencode HTTP 服务器（内建）
-    ├─ createOpencodeClient()  # SDK 客户端，连接本地服务器
-    └─ Telegraf.launch()      # Telegram bot，长轮询
+packages/opencode/src/cli/cmd/telegram/
+  index.ts     TelegramCommand + stateful handlers
+  config.ts    Model catalog (server-backed), config read/write,
+               stopgap getSessionTokens (DB-direct; see TODO there)
+  whisper.ts   Voice transcription (whisper.cpp + ffmpeg pre-decode)
+  paths.ts     DB path + sessions file + config dir resolution
+  log.ts       Log helper for non-Effect contexts
+  format.ts    Text truncation
 ```
 
-所有接口（TUI、Web、Telegram、Slack）都通过 SDK 连接到同一套 HTTP API，不共享实现代码。
+## Bot commands
 
-## Bot 命令
+| command              | what it does                                                  |
+|----------------------|---------------------------------------------------------------|
+| `/start`             | welcome + command list                                        |
+| `/new`               | create a new session (becomes active; old one archived)       |
+| `/abort`             | stop the current turn                                         |
+| `/status`            | session id (N/M if multi), model, state, tokens + context     |
+| `/share`             | get a shareable link                                          |
+| `/model`             | show inline picker or `/model <query>` to switch              |
+| `/compact`           | summarize the current session                                 |
+| `/fork`              | fork at the last user message                                 |
+| `/retry`             | resend the last user prompt                                   |
+| `/sessions`          | list this chat's sessions, tap to switch / new                |
+| `/to <id> <message>` | route a prompt to a specific session in this chat             |
+| `/whoami`            | show your chat id                                             |
+| `/help`              | help                                                          |
 
-| 命令 | 功能 |
-|------|------|
-| `/start` | 欢迎说明 |
-| `/new` | 创建新 session |
-| `/abort` | 中止当前任务 |
-| `/status` | 查看 session ID |
-| `/share` | 获取分享链接 |
-| `/help` | 帮助说明 |
-| 直接发消息 | 自动创建 session + 发送 prompt |
+Any other message is sent as a prompt to the active session. If no
+session exists, one is created automatically.
 
-## 事件流处理
+## Multi-session
 
-通过 `client.event.subscribe()` 订阅 SSE 事件：
-- `message.part.updated` (type: "text") → 当文字内容变化时推送到 Telegram
-- `message.part.updated` (type: "tool", status: "completed") → 工具完成时显示工具名称
-- 内容和工具名称截断为 4000/2000 字符（Telegram 限制）
+Each chat can hold multiple sessions. `/new` archives the current
+active session and starts a new one (the old one stays in the chat
+and can be re-activated via `/sessions`). All sessions in a chat can
+be in-flight in parallel — busy guard is per-session, not per-chat.
 
-## 限制
+The `chat-id → { active, sessions: { sid: state }, order }` map is
+persisted to `~/.local/share/opencode/telegram-sessions.json` (debounced
+500ms). The old single-session format is auto-migrated on load.
 
-- 单条消息最大 4096 字符（Telegram API 限制）
-- 长回复会被截断，后续更新会发送新消息
-- 不支持图片、语音等多媒体消息
+## Media
+
+- **Photo** — downloaded, base64'd, sent as `{type:"file", mime:"image/jpeg", url:<data URI>, filename}` so vision-capable models see the image. 6MB cap.
+- **Voice / audio** — decoded to 16kHz mono PCM via ffmpeg, then transcribed by local whisper.cpp (`WHISPER_BIN`, `WHISPER_MODEL` env vars). 120s cap. The transcribed text is sent as a normal prompt with a `[voice]` marker.
+- **Document** — downloaded, sent as a file part. 20MB cap.
+
+## Streaming
+
+The assistant text stream is rendered in place via `editMessageText`
+with a 1.5s throttle (Telegram caps edits at ~20/min on the same
+message). Reasoning, tool completions, and patch summaries each
+open a new message so they don't fight the streaming edit for the
+same handle.
+
+## Event stream
+
+The bot subscribes to `client.event.subscribe()` (SSE) and reconnects
+with exponential backoff (1s → 2s → 4s → … capped at 60s, ±30% jitter)
+on disconnect.
+
+## Concurrency
+
+`SessionState.inflight` is set when `promptAsync` is dispatched and
+cleared by the `session.status: idle` event. A second prompt arriving
+mid-turn is held by a `Promise` (`infllightWait`) until the server
+acknowledges the abort, or 5s, whichever comes first.
+
+## Persistence
+
+The chat-id → `{ active, sessions, order }` map is persisted to
+`~/.local/share/opencode/telegram-sessions.json` (debounced 500ms).
+Older single-session files are auto-migrated to the new shape on load.
+
+## Environment variables
+
+| variable                 | CLI option        | required | notes                                          |
+|--------------------------|-------------------|----------|------------------------------------------------|
+| `TELEGRAM_BOT_TOKEN`     | `--token`         | yes      | one of env / flag must be set                  |
+| `TELEGRAM_ALLOWED_USERS` | `--allowed-users` | no       | comma-separated chat IDs; empty = allow all    |
+| `WHISPER_BIN`            | —                 | no       | defaults to `/opt/homebrew/bin/whisper-cli`    |
+| `WHISPER_MODEL`          | —                 | no       | defaults to `~/models/whisper/ggml-large-v3-turbo.bin` |
+| `OPENCODE_DEFAULT_MODEL` | —                 | no       | `providerID/modelID`; overrides config         |
+| `OPENCODE_DEFAULT_PROVIDER` | —              | no       | used when default model lacks provider prefix  |
+| `OPENCODE_CONFIG_DIR`    | —                 | no       | for `/model` config reads/writes               |
+| `OPENCODE_PRINT_LOGS`    | `--print-logs`    | no       | set to `1` to mirror bot logs to stderr        |
+| `OPENCODE_LOG_LEVEL`     | `--log-level`     | no       | `DEBUG` / `INFO` / `WARN` / `ERROR`            |
+
+## Limitations
+
+- Long-polling only. Webhook mode is not yet supported.
+- No reply context (the bot ignores the message being replied to).
+- Image-part MIME detection on the model side depends on the model's
+  vision capabilities.
