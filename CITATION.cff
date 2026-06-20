@@ -1,0 +1,18 @@
+cff-version: 1.2.0
+message: "If you use OpenCode in a paper or publication, please cite it as below."
+type: software
+title: "OpenCode"
+abstract: "The open source AI coding agent."
+date-released: 2024-01-01
+license: MIT
+url: "https://opencode.ai"
+repository-code: "https://github.com/anomalyco/opencode"
+keywords:
+  - ai
+  - coding-agent
+  - cli
+  - llm
+  - opencode
+authors:
+  - name: "OpenCode authors and community"
+    website: "https://github.com/anomalyco/opencode/graphs/contributors"
