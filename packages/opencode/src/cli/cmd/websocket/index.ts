@@ -9,7 +9,7 @@ import { startEventForwarder } from "./events"
 import { log } from "./log"
 
 type WebsocketArgs = NetworkOptions & {
-  port?: number
+  wsPort?: number
   readonly _: Array<string | number>
 }
 
@@ -22,15 +22,20 @@ export const WebsocketCommand = effectCmd({
   instance: false,
   builder: (yargs: Argv) =>
     withNetworkOptions(yargs)
-      .option("port", {
+      // Bridge listens on a different port from the opencode
+      // server. Naming it --ws-port to avoid shadowing the
+      // --port flag from withNetworkOptions (which sets the
+      // opencode server's port). The WEBSOCKET_PORT env var
+      // is the legacy way to set this; keep it for back-compat.
+      .option("ws-port", {
         type: "number",
-        describe: "WebSocket bridge port (or WEBSOCKET_PORT env var, default 9999)",
-        default: 9999,
+        describe: "WebSocket bridge port (env: WEBSOCKET_PORT, default 9999)",
+        default: Number.parseInt(process.env.WEBSOCKET_PORT ?? "9999"),
       })
       .check((argv) => {
-        const port = argv.port
+        const port = (argv as { wsPort?: unknown }).wsPort
         if (typeof port !== "number" || !Number.isInteger(port) || port < 0 || port > 65535) {
-          throw new Error(`--port must be an integer in 0..65535, got: ${String(port)}`)
+          throw new Error(`--ws-port must be an integer in 0..65535, got: ${String(port)}`)
         }
         return true
       }),
@@ -44,7 +49,10 @@ export const WebsocketCommand = effectCmd({
     // single binary that doesn't need a separate
     // `opencode serve` running.
     const { Server } = yield* Effect.promise(() => import("../../../server/server"))
-    const netOpts = yield* resolveNetworkOptions(args)
+    // Force the in-process opencode server to port 0 so
+    // it picks a random free port. The WS bridge listens
+    // on the user-facing --ws-port.
+    const netOpts = { ...(yield* resolveNetworkOptions(args)), port: 0 }
     const server = yield* Effect.promise(() => Server.listen(netOpts))
     yield* Effect.logInfo("websocket server up", { url: server.url.toString() })
 
@@ -58,7 +66,7 @@ export const WebsocketCommand = effectCmd({
     // event forwarder broadcasts to every member; the
     // per-socket ClientState lives on `ws.data`.
     const clients = new Set<unknown>()
-    const port = args.port ?? Number.parseInt(process.env.WEBSOCKET_PORT ?? "9999")
+    const port = args.wsPort ?? Number.parseInt(process.env.WEBSOCKET_PORT ?? "9999")
     const hostname = args.hostname ?? "127.0.0.1"
 
     const built = buildServer({
