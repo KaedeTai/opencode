@@ -141,6 +141,16 @@ For more info on how to configure OpenCode, [**head over to our docs**](https://
 
 If you're interested in contributing to OpenCode, please read our [contributing docs](./CONTRIBUTING.md) before submitting a pull request.
 
+By participating, you agree to follow our [Code of Conduct](./CODE_OF_CONDUCT.md).
+
+### Support
+
+- 📖 [Docs](https://opencode.ai/docs)
+- 💬 [Discord](https://discord.gg/opencode) — quick questions, real-time chat
+- 🐛 [GitHub Issues](https://github.com/anomalyco/opencode/issues/new/choose) — bugs, feature requests
+- 🔒 [Security](./SECURITY.md) — vulnerability disclosure
+- 📋 [.github/SUPPORT.md](./.github/SUPPORT.md) — full channel guide and what to include
+
 ### Building on OpenCode
 
 If you are working on a project that's related to OpenCode and is using "opencode" as part of its name, for example "opencode-dashboard" or "opencode-mobile", please add a note to your README to clarify that it is not built by the OpenCode team and is not affiliated with us in any way.

@@ -1,5 +1,9 @@
 # @opencode-ai/websocket
 
+Part of the [OpenCode](https://opencode.ai) project — see the
+[repo root README](../../README.md), [CONTRIBUTING.md](../../CONTRIBUTING.md),
+and [LICENSE](../../LICENSE).
+
 Standalone WebSocket bridge for opencode. Runs a separate Bun server that
 wraps the opencode SDK and forwards every event over a WebSocket connection,
 so clients that can't or don't want to use SSE (browsers, mobile apps,

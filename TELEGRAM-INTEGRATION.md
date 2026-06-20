@@ -1,8 +1,13 @@
 # Opencode Telegram Integration
 
-Telegram bot built into the opencode CLI. Runs the opencode server
-in-process and connects a Telegraf bot to it, so any chat can drive
-an opencode session over messaging.
+Telegram bot built into the [opencode](https://opencode.ai) CLI — see
+the [repo root README](./README.md) and [LICENSE](./LICENSE). Runs the
+opencode server in-process and connects a Telegraf bot to it, so any chat
+can drive an opencode session over messaging.
+
+Want to extend the bot or fix a bug? See
+[CONTRIBUTING.md](./CONTRIBUTING.md) for the workflow, and
+[CODE_OF_CONDUCT.md](./CODE_OF_CONDUCT.md) for the rules of the road.
 
 ## Usage
 
