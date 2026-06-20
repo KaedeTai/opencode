@@ -3,3 +3,9 @@ contact_links:
   - name: 💬 Discord Community
     url: https://discord.gg/opencode
     about: For quick questions or real-time discussion. Note that issues are searchable and help others with the same question.
+  - name: ❓ Support & Help
+    url: https://github.com/anomalyco/opencode/blob/dev/.github/SUPPORT.md
+    about: Where to get help: bug reports, feature requests, security, commercial inquiries, and the channels we won't help in.
+  - name: 📜 Code of Conduct
+    url: https://github.com/anomalyco/opencode/blob/dev/CODE_OF_CONDUCT.md
+    about: The rules of the road. By participating in this project you agree to follow it.
