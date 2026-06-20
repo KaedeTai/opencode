@@ -10,16 +10,20 @@ When to use:
 - You want a second opinion from a different model on the
   same task. Same as above but pick a peer opencode that's
   configured with a different provider.
-- You want a long-running background task. Use `detached: true`
-  to fire-and-forget; the result lands in a file the agent
-  reads back later. Lets the main agent keep working while
-  the sub-agent grinds on a slow task.
+- You want a long-running background task and have it push
+  the result back into your context automatically. Pass
+  `background: true`; the tool returns immediately and the
+  peer's response is auto-injected as a synthetic message in
+  your session when it finishes — no polling needed.
 
 Not for:
 - Talking to the current opencode's own server. Use the
   existing prompt flow / sub-agents for that.
 - Browsing the opencode HTTP API. Use `webfetch` against
   the opencode REST endpoints instead.
+- One-off delegation that doesn't need cross-process
+  isolation. Use the `task` tool — it's in-process,
+  cheaper, and already auto-injects with `background: true`.
 
 Usage notes:
 - The peer must be reachable at the given `url` (or the
@@ -47,16 +51,39 @@ Usage notes:
   To pick a model on the peer, edit the peer's
   `~/.config/opencode/opencode.jsonc` `model` / `provider`
   fields or use the peer's `/model` command.
-- Sync mode is the default and recommended: the tool
-  blocks until the peer goes idle (or `timeout` fires,
-  default 60s, max 5 min). One tool call = one round trip
-  = one answer to reason about. Don't reach for `detached`
-  unless you specifically need to start a task and
-  continue with other work in the same turn.
-- `detached: true` returns a `task_id` and a `resultFile`
-  path immediately. The job runs in-process via the
-  opencode BackgroundJob registry — fetch the result
-  by calling `ws_client({ taskId })` (optionally with
-  `timeout` in seconds; default 60, max 300). The
-  `resultFile` is also written for external observers,
-  but polling the file is no longer required.
+- Permission relay: when the peer needs approval for a
+  tool call, the request is forwarded to the parent
+  session's permission UI as a normal `ctx.ask` prompt.
+  Approval replies `once`; denial replies `reject`. The
+  `always` choice isn't exposed through this path — the
+  parent's ruleset owns persistent grants. Each relayed
+  decision is recorded in a `<peer_permissions>` block in
+  the tool output so the caller can see what was
+  authorized. Permissions are processed strictly
+  sequentially because the WS bridge tracks only one
+  in-flight permission per client.
+
+Modes:
+- Sync (default): the tool blocks until the peer goes idle
+  (or `timeout` fires, default 60s, max 5 min). One tool
+  call = one round trip = one answer.
+- `background: true` (recommended for fire-and-forget):
+  the tool returns immediately with a task_id. The peer
+  runs in the background; when it finishes, the response
+  is auto-injected into your context as a synthetic
+  `<ws_peer>` message — the same pattern as `task` with
+  `background: true`. Do NOT poll, sleep, or duplicate the
+  work; just keep going and the result will arrive.
+- `detached: true`: legacy alias for `background: true`.
+  Same behavior; kept for backward compatibility.
+- `taskId` (legacy): poll a previously-started background
+  task by id. Deprecated — `background: true` auto-injects,
+  so manual polling is no longer the recommended flow.
+  Kept for external scripts and for tasks started by other
+  processes.
+
+The result file at `~/.config/opencode/peer-tasks/<id>.json`
+is still written for external observers (humans, scripts in
+other processes), but the agent itself should NOT read it —
+just continue with other work and the auto-injected message
+will land in the next turn.
