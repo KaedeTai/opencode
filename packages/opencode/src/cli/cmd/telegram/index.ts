@@ -3,7 +3,7 @@ import { UI } from "../../ui"
 import { effectCmd, fail } from "../../effect-cmd"
 import { withNetworkOptions, resolveNetworkOptions } from "../../network"
 import type { NetworkOptions } from "../../network"
-import { getModelCatalog, getCurrentModel, setDefaultModel, resolveModel, getSessionTokens } from "./config"
+import { getModelCatalog, getModelContextLimit, getCurrentModel, setDefaultModel, resolveModel, getSessionTokens } from "./config"
 import { trunc } from "./format"
 import { log } from "./log"
 import { transcribeAudio } from "./whisper"
@@ -335,10 +335,16 @@ export const TelegramCommand = effectCmd({
     // Send a question answer to the server via the v2 REST endpoint
     // (v1 SDK has no question API; v2 has client.question.reply but importing
     // both SDKs is overkill — just fetch directly.)
+    //
+    // Server schema: `Question.Answer = string[]` and `payload.answers` is
+    // `Array<Question.Answer>` (i.e. string[][]). Each question in the
+    // question.asked event gets one slot; each slot is an array of selected
+    // option labels (multi-select supported). For a single-select click we
+    // wrap the chosen label in a 1-element array.
     async function answerQuestion(
       cid: string,
       questionID: string,
-      answers: string[],
+      answers: string[][],
       sessionID: string,
     ) {
       try {
@@ -532,7 +538,7 @@ export const TelegramCommand = effectCmd({
       if (pendingQID && !text.startsWith("/")) {
         const pending = pendingQuestions.get(pendingQID)
         if (pending) {
-          await answerQuestion(cid, pendingQID, [text], pending.sessionID)
+          await answerQuestion(cid, pendingQID, [[text]], pending.sessionID)
           pendingQuestions.delete(pendingQID)
         } else {
           pendingCustomQuestion.delete(cid)
@@ -632,7 +638,14 @@ export const TelegramCommand = effectCmd({
             // session.get() returns the session struct but not a
             // rolled-up total.
             const tokens = getSessionTokens(session.sessionId)
-            const modelCtxLimit = tokens?.modelContextLimit ?? null
+            // tokens.modelContextLimit is null at this layer (config.ts
+            // doesn't have the client); look it up from the dynamic
+            // catalog when we know which model is active. Falls back
+            // to the static map if the server is unreachable.
+            const curModel = getCurrentModel()
+            const modelCtxLimit = curModel
+              ? await getModelContextLimit(client, curModel.providerID, curModel.modelID)
+              : null
             const total = tokens?.total ?? 0
             const input = tokens?.input ?? 0
             const output = tokens?.output ?? 0
@@ -698,7 +711,7 @@ export const TelegramCommand = effectCmd({
           safe(async () => {
             const s = sessions.get(cid)
             if (!s) { await reply(cid, "No active session. Send /new to create one."); return }
-            const catalog = getModelCatalog()
+            const catalog = await getModelCatalog(client)
             if (catalog.length === 0) {
               await reply(cid, "❌ Model catalog is empty.")
               return
@@ -760,7 +773,7 @@ export const TelegramCommand = effectCmd({
             let providerID = cur?.providerID
             let modelID = cur?.modelID
             if (!providerID || !modelID) {
-              const catalog = getModelCatalog()
+              const catalog = await getModelCatalog(client)
               if (catalog.length === 0) {
                 await reply(cid, "❌ No model available to summarize with.")
                 return
@@ -913,7 +926,7 @@ export const TelegramCommand = effectCmd({
       if (data.startsWith("model:")) {
         const idx = Number.parseInt(data.slice("model:".length), 10)
         if (!Number.isFinite(idx) || idx < 0) return
-        const catalog = getModelCatalog()
+        const catalog = await getModelCatalog(client)
         const hit = catalog[idx]
         if (!hit) {
           await ctx.reply(`❌ Unknown model index: ${idx}`).catch(() => {})
@@ -960,7 +973,7 @@ export const TelegramCommand = effectCmd({
           return
         }
         const label = pending.options[optionIndex].label
-        await answerQuestion(cid, questionID, [label], pending.sessionID)
+        await answerQuestion(cid, questionID, [[label]], pending.sessionID)
         pendingQuestions.delete(questionID)
         return
       }
@@ -1229,13 +1242,19 @@ export const TelegramCommand = effectCmd({
                   files: Array<{ path: string; additions?: number; deletions?: number }>
                 }
                 if (!p.files?.length) continue
+                // The model sometimes hallucinates bogus paths ("undefined")
+                // or empty files when it loses track of an edit. Drop
+                // those before rendering so the user doesn't see
+                // "📝 1 file changed: undefined +0 -0".
+                const realFiles = p.files.filter((f) => f.path && f.path !== "undefined")
+                if (realFiles.length === 0) continue
                 closeStream(s, cid)
-                const lines = p.files.map((f) => {
+                const lines = realFiles.map((f) => {
                   const add = f.additions ?? 0
                   const del = f.deletions ?? 0
                   return `  ${f.path}  +${add} -${del}`
                 })
-                send(cid, `📝 ${p.files.length} file${p.files.length === 1 ? "" : "s"} changed:\n${lines.join("\n")}`)
+                send(cid, `📝 ${realFiles.length} file${realFiles.length === 1 ? "" : "s"} changed:\n${lines.join("\n")}`)
               }
             } catch (evErr: any) {
               log.error("event loop inner error", { message: evErr?.message ?? String(evErr) })
