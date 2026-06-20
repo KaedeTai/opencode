@@ -9,6 +9,41 @@ import { log } from "./log"
 import { transcribeAudio } from "./whisper"
 import { getSessionsFile } from "./paths"
 
+// The v2 SDK returns loosely-typed responses for several endpoints
+// (session.get / .list / .messages / .fork / .summarize). The fields
+// the bot actually reads don't always line up with the declared
+// `Session` shape — different opencode versions emit different
+// shapes, and the SDK is a step behind. Rather than cast to `any`,
+// we declare a narrow view that captures only what the bot reads.
+// `as unknown as SessionLike` makes the intent explicit and lets
+// the type checker flag real regressions.
+type SessionLike = {
+  id?: string
+  title?: string
+  status?: string
+  messages?: number
+  messageCount?: number
+  model?:
+    | string
+    | { providerID?: string; modelID?: string; id?: string; model?: unknown; provider?: string; name?: string }
+    | null
+  providerID?: string
+  provider?: string
+}
+
+type SessionMessageListItem = {
+  info?: { id?: string; role?: string }
+  parts?: Array<{ type?: string; text?: string; synthetic?: boolean }>
+}
+
+type SessionListItem = {
+  id: string
+  title?: string
+  time?: { updated?: number }
+}
+
+type ErrorLike = { error?: { _tag?: string; data?: { message?: string }; message?: string } | null }
+
 type TelegramArgs = NetworkOptions & {
   token?: string
   allowedUsers?: string
@@ -93,8 +128,7 @@ export const TelegramCommand = effectCmd({
         const res = await client.session.create({ body: { title: `Telegram ${cid}` } })
         if (res.error) return null
         const sessionId = res.data.id
-        sessions.set(cid, { sessionId, lastSent: null, lastReasoning: null, userPrompt: null, streamMsgId: null, lastStreamEdit: null, inflight: false, inflightWait: null, inflightWaitTimer: null })
-        persistSessions()
+        addSession(cid, { sessionId, lastSent: null, lastReasoning: null, userPrompt: null, streamMsgId: null, lastStreamEdit: null, inflight: false, inflightWait: null, inflightWaitTimer: null })
         return sessionId
       } catch (e: any) {
         log.error("createSession", { message: e?.message ?? String(e) })
@@ -102,12 +136,12 @@ export const TelegramCommand = effectCmd({
       }
     }
 
-    function chatOf(sessionId: string): string | null {
-      for (const [cid, s] of sessions.entries()) {
-        if (s.sessionId === sessionId) return cid
-      }
-      return null
-    }
+    // Resolve the chat that owns a session. Backed by the reverse
+    // index so it's O(1) — the inline version (iterating `chats`)
+    // would scale linearly with the number of chats the bot has
+    // ever seen.
+    // (Implementation lives in the helpers block below; the binding
+    // is hoisted by `function` so the call sites above resolve.)
 
     function allow(chatId: string): boolean {
       return allowedUsers.length === 0 || allowedUsers.includes(chatId)
@@ -271,19 +305,30 @@ export const TelegramCommand = effectCmd({
       cid: string,
       parts: Array<Record<string, any>>,
       userPromptForEcho: string,
+      options: { targetSessionId?: string } = {},
     ) {
-      let session = sessions.get(cid)
+      // Resolve the target session. `targetSessionId` lets callers
+      // route a prompt to a non-active session (e.g. the user typed
+      // "[<id>] hi" or invoked `/to <id>`). Otherwise we use the
+      // chat's active session, creating one on first use.
+      let session = options.targetSessionId
+        ? getSession(cid, options.targetSessionId)
+        : getActiveSession(cid)
       if (!session) {
         const sid = await createSession(cid)
         if (!sid) return { error: "Failed to create session." as const }
-        session = sessions.get(cid)
+        session = options.targetSessionId
+          ? getSession(cid, options.targetSessionId) ?? getActiveSession(cid)
+          : getActiveSession(cid)
         if (!session) return { error: "Failed to create session." as const }
       }
-      // Busy guard. If the previous prompt is still running, abort it
-      // and wait for the server to acknowledge (session.status → idle)
-      // before sending the new one. Without this, the second promptAsync
-      // would either queue server-side (silently delaying) or race
-      // against the first, fragmenting the assistant output.
+      // Busy guard. If the previous prompt is still running on THIS
+      // session, abort it and wait for the server to acknowledge
+      // (session.status → idle) before sending the new one. Without
+      // this, the second promptAsync would either queue server-side
+      // (silently delaying) or race against the first, fragmenting
+      // the assistant output. Other sessions in the same chat are
+      // unaffected — the user can drive them in parallel.
       if (session.inflight) {
         log.warn("busy on session, aborting previous", { sessionId: session.sessionId })
         await reply(cid, "⏳ Bot is busy. Aborting the previous turn and sending your message…")
@@ -297,13 +342,13 @@ export const TelegramCommand = effectCmd({
         // force-resolves in case the event is lost — we don't want to
         // hang a user prompt forever.
         await new Promise<void>((resolve) => {
-          session.inflightWait = resolve
-          session.inflightWaitTimer = setTimeout(() => {
-            if (!session.inflightWait) return
-            log.warn("idle wait timeout, forcing inflight clear", { sessionId: session.sessionId })
-            session.inflight = false
-            session.inflightWait = null
-            session.inflightWaitTimer = null
+          session!.inflightWait = resolve
+          session!.inflightWaitTimer = setTimeout(() => {
+            if (!session!.inflightWait) return
+            log.warn("idle wait timeout, forcing inflight clear", { sessionId: session!.sessionId })
+            session!.inflight = false
+            session!.inflightWait = null
+            session!.inflightWaitTimer = null
             resolve()
           }, 5000)
         })
@@ -312,7 +357,12 @@ export const TelegramCommand = effectCmd({
       session.inflight = true
       const result = await client.session.promptAsync({
         path: { id: session.sessionId },
-        body: { parts: parts as any },
+        // parts is `Array<Record<string, any>>` because the SDK's
+        // Part union is several types we mix in one array (text
+        // + file). The SDK accepts a wider type than the union
+        // here, hence the double cast (Record<string, any> ->
+        // unknown -> SDK union).
+        body: { parts: parts as unknown as never[] },
       })
       if (result.error) {
         session.inflight = false
@@ -399,22 +449,143 @@ export const TelegramCommand = effectCmd({
       // next prompt isn't held forever.
       inflightWaitTimer: ReturnType<typeof setTimeout> | null
     }
-    const sessions = new Map<string, SessionState>()
+    // Per-chat state. Each chat can have multiple sessions; the
+    // active one receives new prompts by default. All in-flight
+    // turns are tracked per-session, so one chat can have several
+    // sessions running in parallel (multi-prompt scenarios).
+    type ChatState = {
+      // Session id of the currently active session, or null when the
+      // chat has no sessions (transient — `/new` will populate it).
+      activeSessionId: string | null
+      // All sessions for this chat, keyed by session id. Holds the
+      // active + archived ones together so handlers can iterate.
+      sessions: Record<string, SessionState>
+      // Session id ordering, most recent first. Drives /sessions
+      // listings and pickers.
+      order: string[]
+    }
+    const chats = new Map<string, ChatState>()
+    // Reverse index for chatOf(sessionId). Without this, looking
+    // up a chat from a session id would have to scan every chat
+    // (slow as the bot runs longer).
+    const sessionToChat = new Map<string, string>()
+
     // Track pending questions so callback buttons can resolve label from index
     const pendingQuestions = new Map<string, { sessionID: string; options: Array<{ label: string; description: string }> }>()
     // Track which question each chat is currently waiting for a custom answer on
     const pendingCustomQuestion = new Map<string, string>()
 
-    // Load existing sessions on startup (only if file exists)
+    // ── Chat / session helpers ────────────────────────────────────
+    // Get the active SessionState for a chat (null if none).
+    function getActiveSession(cid: string): SessionState | null {
+      const chat = chats.get(cid)
+      if (!chat?.activeSessionId) return null
+      return chat.sessions[chat.activeSessionId] ?? null
+    }
+
+    // Get the SessionState for a specific session id in a chat.
+    function getSession(cid: string, sessionId: string): SessionState | null {
+      return chats.get(cid)?.sessions[sessionId] ?? null
+    }
+
+    // Add a new session to a chat. By default it becomes the active
+    // one. If makeActive is false, the previously active session
+    // (if any) stays active — useful for /fork where the fork
+    // might or might not replace the current session.
+    function addSession(cid: string, state: SessionState, makeActive = true) {
+      let chat = chats.get(cid)
+      if (!chat) {
+        chat = { activeSessionId: null, sessions: {}, order: [] }
+        chats.set(cid, chat)
+      }
+      chat.sessions[state.sessionId] = state
+      // Move to front of order (most recent first).
+      chat.order = [state.sessionId, ...chat.order.filter((id) => id !== state.sessionId)]
+      sessionToChat.set(state.sessionId, cid)
+      if (makeActive || !chat.activeSessionId) {
+        chat.activeSessionId = state.sessionId
+      }
+      persistChats()
+    }
+
+    // Switch the active session in a chat. No-op if the session
+    // doesn't belong to the chat.
+    function setActiveSession(cid: string, sessionId: string) {
+      const chat = chats.get(cid)
+      if (!chat) return
+      if (!chat.sessions[sessionId]) return
+      chat.activeSessionId = sessionId
+      chat.order = [sessionId, ...chat.order.filter((id) => id !== sessionId)]
+      persistChats()
+    }
+
+    // Remove a session from a chat. If it was active, promote the
+    // next-most-recent remaining session (or null if the chat
+    // becomes empty).
+    function removeSession(cid: string, sessionId: string) {
+      const chat = chats.get(cid)
+      if (!chat) return
+      delete chat.sessions[sessionId]
+      chat.order = chat.order.filter((id) => id !== sessionId)
+      sessionToChat.delete(sessionId)
+      if (chat.activeSessionId === sessionId) {
+        chat.activeSessionId = chat.order[0] ?? null
+      }
+      if (chat.order.length === 0) {
+        chats.delete(cid)
+      }
+      persistChats()
+    }
+
+    // Find the chat that owns a session id. Uses the reverse index
+    // so it's O(1).
+    function chatOf(sessionId: string): string | null {
+      return sessionToChat.get(sessionId) ?? null
+    }
+
+    // Load existing chats on startup. File format is a plain JSON
+    // object keyed by chat id; supports the v1 (single-session per
+    // chat) and v2 (multi-session) shapes — v1 entries are migrated
+    // on load to the v2 shape.
     const sessionsFileExists = yield* Effect.promise(() => Bun.file(SESSIONS_FILE).exists())
     if (sessionsFileExists) {
       try {
-        const data = yield* Effect.promise(() => Bun.file(SESSIONS_FILE).json())
-        for (const [cid, sess] of Object.entries(data as Record<string, any>)) {
-          // Backward compat: older session files don't have streamMsgId.
-          sessions.set(cid, { ...sess, streamMsgId: null, lastStreamEdit: null, inflight: false, inflightWait: null, inflightWaitTimer: null })
+        const data = (yield* Effect.promise(() => Bun.file(SESSIONS_FILE).json())) as Record<string, any>
+        for (const [cid, entry] of Object.entries(data)) {
+          if (!entry) continue
+          // v2 shape: { active, sessions: { sid: state }, order: [] }
+          if (entry.sessions && typeof entry.sessions === "object") {
+            const chat: ChatState = { activeSessionId: entry.active ?? null, sessions: {}, order: [] }
+            for (const [sid, raw] of Object.entries(entry.sessions as Record<string, any>)) {
+              const s = { ...(raw as object), streamMsgId: null, lastStreamEdit: null, inflight: false, inflightWait: null, inflightWaitTimer: null }
+              chat.sessions[sid] = s as SessionState
+              chat.order.push(sid)
+              sessionToChat.set(sid, cid)
+            }
+            if (Array.isArray(entry.order)) {
+              // Trust the persisted order, but reconcile in case
+              // it mentions sessions that no longer exist.
+              chat.order = entry.order.filter((id: string) => chat.sessions[id])
+            } else {
+              chat.order.reverse()  // persisted most-recent-last; we want first
+            }
+            // If active is missing or refers to a deleted session,
+            // fall back to the first ordered session.
+            if (!chat.activeSessionId || !chat.sessions[chat.activeSessionId]) {
+              chat.activeSessionId = chat.order[0] ?? null
+            }
+            chats.set(cid, chat)
+            continue
+          }
+          // v1 shape: { [cid]: { sessionId, lastSent, ... } } — single session per chat
+          if (typeof entry === "object" && "sessionId" in entry) {
+            const state = { ...(entry as object), streamMsgId: null, lastStreamEdit: null, inflight: false, inflightWait: null, inflightWaitTimer: null } as SessionState
+            chats.set(cid, { activeSessionId: state.sessionId, sessions: { [state.sessionId]: state }, order: [state.sessionId] })
+            sessionToChat.set(state.sessionId, cid)
+          }
         }
-        yield* Effect.logDebug("telegram loaded persisted sessions", { count: sessions.size })
+        const totalSessions = [...chats.values()].reduce((sum, c) => sum + c.order.length, 0)
+        yield* Effect.logDebug("telegram loaded persisted chats", { chats: chats.size, sessions: totalSessions })
       } catch (e: any) {
         yield* Effect.logWarning("telegram failed to load sessions", { message: e?.message ?? String(e) })
       }
@@ -422,18 +593,25 @@ export const TelegramCommand = effectCmd({
       yield* Effect.logDebug("telegram no persisted sessions file, starting fresh")
     }
 
-    // Persist sessions to disk (debounced)
+    // Persist chats to disk (debounced). Serializes the active
+    // session id plus the full sessions record per chat.
     let persistTimer: ReturnType<typeof setTimeout> | null = null
-    function persistSessions() {
+    function persistChats() {
       if (persistTimer) clearTimeout(persistTimer)
       persistTimer = setTimeout(async () => {
         try {
-          await Bun.write(SESSIONS_FILE, JSON.stringify(Object.fromEntries(sessions), null, 2))
+          const snapshot: Record<string, { active: string | null; sessions: Record<string, SessionState>; order: string[] }> = {}
+          for (const [cid, chat] of chats.entries()) {
+            snapshot[cid] = { active: chat.activeSessionId, sessions: chat.sessions, order: chat.order }
+          }
+          await Bun.write(SESSIONS_FILE, JSON.stringify(snapshot, null, 2))
         } catch (e: any) {
           log.error("failed to persist sessions", { message: e?.message ?? String(e) })
         }
       }, 500)
     }
+    // (Old name was `persistSessions`; the multi-session refactor
+    // renamed it to `persistChats` to match the new data shape.)
 
     // ── Message handler ────────────────────────────────────────────
     bot.on("message", async (ctx: any) => {
@@ -563,7 +741,7 @@ export const TelegramCommand = effectCmd({
           return
         }
         if (cmd === "abort") {
-          const session = sessions.get(cid)
+          const session = getActiveSession(cid)
           if (!session) { await ctx.reply("No active session."); return }
           await client.session.abort({ path: { id: session.sessionId } }).catch(() => {})
           session.lastSent = null
@@ -578,13 +756,13 @@ export const TelegramCommand = effectCmd({
         }
         if (cmd === "status") {
           safe(async () => {
-            const session = sessions.get(cid)
+            const session = getActiveSession(cid)
             if (!session) { await ctx.reply("No active session. Send /new to create one."); return }
             // Pull server-side session state for the model + message count.
             // The shape of session.get() varies across opencode versions
             // (we hit "omlx/undefined" before), so read defensively.
             const sesRes = await client.session.get({ path: { id: session.sessionId } }).catch(() => null)
-            const data = (sesRes?.data as any) ?? {}
+            const data = (sesRes?.data as unknown as SessionLike | undefined) ?? {}
             // The server's session.get() can return `model` as either a
             // { providerID, modelID } object or a flat string, depending
             // on version. Sometimes modelID is itself an object (e.g.
@@ -617,7 +795,10 @@ export const TelegramCommand = effectCmd({
               }
               return null
             }
-            modelStr = extract(data.model) ?? extract(data.modelID)
+            // SessionLike doesn't expose a top-level modelID
+            // (the server returns model as a nested object), but
+            // defensive read for an alternative flat shape.
+            modelStr = extract(data.model) ?? extract((data as { modelID?: unknown }).modelID)
             // If we got a `?/model` placeholder, try to recover the
             // provider from sibling fields.
             if (modelStr?.startsWith("?/")) {
@@ -660,8 +841,14 @@ export const TelegramCommand = effectCmd({
             // Status state — read from server data, fall back to "idle"
             // (most queries land here).
             const state = data.status ?? "idle"
+            // For multi-session chats, label the active session as
+            // "N of M" so the user knows there are others.
+            const chat = chats.get(cid)
+            const totalChats = chat?.order.length ?? 1
+            const idx = chat ? chat.order.indexOf(session.sessionId) + 1 : 1
+            const sessionLabel = totalChats > 1 ? `\`${session.sessionId.slice(0, 8)}…\` (${idx}/${totalChats})` : `\`${session.sessionId.slice(0, 8)}…\``
             const lines: string[] = [
-              `📋 Session: \`${session.sessionId}\``,
+              `📋 Session: ${sessionLabel}`,
               `🤖 Model: \`${current}\``,
               `🔄 State: ${state}${lastReasoning}`,
               `💬 Last: ${lastSent}`,
@@ -692,7 +879,7 @@ export const TelegramCommand = effectCmd({
           return
         }
         if (cmd === "share") {
-          const session = sessions.get(cid)
+          const session = getActiveSession(cid)
           if (!session) { await ctx.reply("No active session."); return }
           const res = await client.session.share({ path: { id: session.sessionId } }).catch(() => null)
           const url = res?.data?.share?.url ?? `Session ${session.sessionId}`
@@ -700,7 +887,7 @@ export const TelegramCommand = effectCmd({
           return
         }
         if (cmd === "help") {
-          await ctx.reply("Commands:\n/new - create session\n/abort - stop task\n/status - show session\n/share - get share link\n/model [query] - show or switch model\n/compact - summarize this session\n/fork - fork at last user message\n/retry - resend last prompt\n/sessions - list & switch sessions\n/whoami - show your chat ID\n/help - show this\n\nOr just send any request!")
+          await ctx.reply("Commands:\n/new - new session (active)\n/abort - stop task\n/status - show session\n/share - get share link\n/model [query] - show or switch model\n/compact - summarize this session\n/fork - fork at last user message\n/retry - resend last prompt\n/sessions - list & switch sessions\n/to <id> <msg> - send a message to a specific session\n/whoami - show your chat ID\n/help - show this\n\nOr just send any request!")
           return
         }
         if (cmd === "whoami") {
@@ -709,7 +896,7 @@ export const TelegramCommand = effectCmd({
         }
         if (cmd === "model") {
           safe(async () => {
-            const s = sessions.get(cid)
+            const s = getActiveSession(cid)
             if (!s) { await reply(cid, "No active session. Send /new to create one."); return }
             const catalog = await getModelCatalog(client)
             if (catalog.length === 0) {
@@ -757,10 +944,10 @@ export const TelegramCommand = effectCmd({
         }
         if (cmd === "compact") {
           safe(async () => {
-            const s = sessions.get(cid)
+            const s = getActiveSession(cid)
             if (!s) { await reply(cid, "No active session. Send /new to create one."); return }
             const msgs = await client.session.messages({ path: { id: s.sessionId } }).catch(() => null)
-            const list = (msgs?.data as any[]) ?? []
+            const list = (msgs?.data as unknown as SessionMessageListItem[] | undefined) ?? []
             const lastUser = [...list].reverse().find((m) => m.info?.role === "user")
             if (!lastUser) {
               await reply(cid, "❌ Nothing to compact — no user messages yet.")
@@ -769,9 +956,9 @@ export const TelegramCommand = effectCmd({
             // Need a model to summarize with. Use the session's current model
             // if known, else the catalog's first.
             const sesRes = await client.session.get({ path: { id: s.sessionId } }).catch(() => null)
-            const cur = (sesRes?.data as any)?.model
-            let providerID = cur?.providerID
-            let modelID = cur?.modelID
+            const cur = (sesRes?.data as unknown as SessionLike | undefined)?.model
+            let providerID = typeof cur === "object" && cur !== null ? cur.providerID : undefined
+            let modelID = typeof cur === "object" && cur !== null ? cur.modelID : undefined
             if (!providerID || !modelID) {
               const catalog = await getModelCatalog(client)
               if (catalog.length === 0) {
@@ -785,9 +972,11 @@ export const TelegramCommand = effectCmd({
             const res = await client.session.summarize({
               path: { id: s.sessionId },
               body: { providerID, modelID },
-            }).catch((e: any) => ({ error: e }))
-            if ((res as any)?.error) {
-              await reply(cid, `❌ Compact failed: ${(res as any).error?.data?.message ?? (res as any).error?.message ?? "unknown"}`)
+            }).catch((e: unknown) => ({ error: e }))
+            if ((res as { error?: unknown })?.error) {
+              const err = (res as ErrorLike).error
+              const msg = err?.data?.message ?? err?.message ?? "unknown"
+              await reply(cid, `❌ Compact failed: ${msg}`)
               return
             }
             await reply(cid, "✅ Compacted.")
@@ -796,11 +985,11 @@ export const TelegramCommand = effectCmd({
         }
         if (cmd === "fork") {
           safe(async () => {
-            const s = sessions.get(cid)
+            const s = getActiveSession(cid)
             if (!s) { await reply(cid, "No active session. Send /new to create one."); return }
             const msgs = await client.session.messages({ path: { id: s.sessionId } }).catch(() => null)
-            const list = (msgs?.data as any[]) ?? []
-            const lastUser = [...list].reverse().find((m) => m.info?.role === "user")
+            const list = (msgs?.data as unknown as SessionMessageListItem[] | undefined) ?? []
+            const lastUser = [...list].reverse().find((m): m is SessionMessageListItem & { info: NonNullable<SessionMessageListItem["info"]> } => m.info?.role === "user")
             if (!lastUser) {
               await reply(cid, "❌ Nothing to fork — no user messages yet.")
               return
@@ -808,24 +997,28 @@ export const TelegramCommand = effectCmd({
             const res = await client.session.fork({
               path: { id: s.sessionId },
               body: { messageID: lastUser.info.id },
-            }).catch((e: any) => ({ error: e }))
-            const newId = (res as any)?.data?.id
+            }).catch((e: unknown) => ({ error: e }))
+            const newId = (res as { data?: { id?: string } })?.data?.id
             if (!newId) {
-              await reply(cid, `❌ Fork failed: ${(res as any)?.error?.data?.message ?? (res as any)?.error?.message ?? "unknown"}`)
+              const err = (res as ErrorLike).error
+              const msg = err?.data?.message ?? err?.message ?? "unknown"
+              await reply(cid, `❌ Fork failed: ${msg}`)
               return
             }
-            // Switch active session to the fork
-            sessions.set(cid, { sessionId: newId, lastSent: null, lastReasoning: null, userPrompt: null, streamMsgId: null, lastStreamEdit: null, inflight: false, inflightWait: null, inflightWaitTimer: null })
+            // Switch active session to the fork. addSession handles
+            // moving the old active to the back of the chat's order
+            // and re-pointing the active id.
+            addSession(cid, { sessionId: newId, lastSent: null, lastReasoning: null, userPrompt: null, streamMsgId: null, lastStreamEdit: null, inflight: false, inflightWait: null, inflightWaitTimer: null })
             await reply(cid, `🍴 Forked!\nOld: \`${s.sessionId.slice(0, 8)}…\`\nNew: \`${newId.slice(0, 8)}…\``)
           }, "fork handler")
           return
         }
         if (cmd === "retry") {
           safe(async () => {
-            const s = sessions.get(cid)
+            const s = getActiveSession(cid)
             if (!s) { await reply(cid, "No active session. Send /new to create one."); return }
             const msgs = await client.session.messages({ path: { id: s.sessionId } }).catch(() => null)
-            const list = (msgs?.data as any[]) ?? []
+            const list = (msgs?.data as unknown as SessionMessageListItem[] | undefined) ?? []
             const lastUser = [...list].reverse().find((m) => m.info?.role === "user")
             if (!lastUser) {
               await reply(cid, "❌ Nothing to retry — no user messages yet.")
@@ -857,33 +1050,84 @@ export const TelegramCommand = effectCmd({
         }
         if (cmd === "sessions") {
           safe(async () => {
-            const list = (await client.session.list().catch(() => null))?.data
-            if (!Array.isArray(list) || list.length === 0) {
-              await reply(cid, "No sessions yet.")
+            const chat = chats.get(cid)
+            if (!chat || chat.order.length === 0) {
+              await reply(cid, "No sessions yet. Send any message to create one, or /new.")
               return
             }
-            const s = sessions.get(cid)
-            const currentId = s?.sessionId
-            // Sort by time.updated desc
-            const sorted = [...list].sort((a: any, b: any) => (b.time?.updated ?? 0) - (a.time?.updated ?? 0))
-            const top = sorted.slice(0, 10)
-            const lines = top.map((sess: any) => {
-              const id = sess.id
-              const short = id.slice(0, 8)
-              const title = sess.title || "(untitled)"
-              const sel = id === currentId ? " ←" : ""
-              return `  ${short}…  ${trunc(title, 40)}${sel}`
+            // Pull titles for each known session. Skip ones that 404
+            // server-side (deleted) and prune them from the chat
+            // so the listing stays clean.
+            const known: Array<{ id: string; title: string; active: boolean }> = []
+            const stale: string[] = []
+            for (const sid of chat.order) {
+              const res = await client.session.get({ path: { id: sid } }).catch(() => null)
+              const resData = res as { error?: unknown; data?: SessionLike } | null
+              if (!res || resData?.error || !resData?.data) {
+                stale.push(sid)
+                continue
+              }
+              const title = resData.data.title ?? "(untitled)"
+              known.push({ id: sid, title, active: sid === chat.activeSessionId })
+            }
+            for (const sid of stale) removeSession(cid, sid)
+            if (known.length === 0) {
+              await reply(cid, "No sessions yet. Send any message to create one, or /new.")
+              return
+            }
+            const lines = known.map((k) => {
+              const short = k.id.slice(0, 8)
+              const mark = k.active ? " ← active" : ""
+              return `  ${short}…  ${trunc(k.title, 40)}${mark}`
             })
-            // Build inline button rows. Limit to top 8 to keep the keyboard sane.
-            const rows = top.slice(0, 8).map((sess: any) => [
+            // Inline keyboard. Cap at 8 to stay readable; Telegram
+            // chokes on very long button stacks.
+            const rows = known.slice(0, 8).map((k) => [
               Markup.button.callback(
-                `${sess.id === currentId ? "✅ " : ""}${sess.id.slice(0, 8)}… ${trunc(sess.title || "(untitled)", 24)}`,
-                `sess:switch:${sess.id}`,
+                `${k.active ? "✅ " : "  "}${k.id.slice(0, 8)}… ${trunc(k.title, 24)}`,
+                `sess:switch:${k.id}`,
               ),
             ])
+            // Add a /new button so the user can grow the list without
+            // typing the command separately.
+            rows.push([Markup.button.callback("➕ New session", "sess:new")])
             const btns = Markup.inlineKeyboard(rows)
-            await reply(cid, `📂 Sessions (${list.length}, showing top ${top.length}):\n${lines.join("\n")}\n\nTap to switch.`, btns)
+            await reply(cid, `📂 Sessions (${known.length}):\n${lines.join("\n")}\n\nTap to switch.`, btns)
           }, "sessions handler")
+          return
+        }
+        if (cmd === "to") {
+          // Route a prompt to a specific session by id. The session
+          // must already belong to this chat (or it 404s — the user
+          // can /sessions first to import one). The rest of the
+          // message after the id is sent as a normal prompt.
+          const target = args[0]
+          if (!target) {
+            await reply(cid, "Usage: /to <sessionId> <message>")
+            return
+          }
+          // Accept either the full session id or a unique 8-char
+          // prefix — the prefix form is what /sessions shows.
+          const chat = chats.get(cid)
+          let resolved: string | null = null
+          if (chat?.sessions[target]) {
+            resolved = target
+          } else {
+            const match = chat?.order.find((id) => id.startsWith(target))
+            if (match) resolved = match
+          }
+          if (!resolved) {
+            await reply(cid, `❌ Session \`${target}\` not in this chat. Use /sessions to see available ones.`)
+            return
+          }
+          const promptText = args.slice(1).join(" ").trim()
+          if (!promptText) {
+            await reply(cid, "Usage: /to <sessionId> <message>")
+            return
+          }
+          setActiveSession(cid, resolved)
+          const res = await dispatchPrompt(cid, [{ type: "text", text: promptText }], promptText, { targetSessionId: resolved })
+          if (res?.error) await reply(cid, `Error: ${res.error}`)
           return
         }
         // Unknown command — fall through to prompt
@@ -917,7 +1161,7 @@ export const TelegramCommand = effectCmd({
         log.debug("callback from non-allowlisted chat, ignoring", { cid })
         return
       }
-      const session = sessions.get(cid)
+      const session = getActiveSession(cid)
 
       // ── Model picker (/model inline buttons) ─────────────────────
       // Format: model:<catalogIndex>  (index into KNOWN_PROVIDERS, see
@@ -978,20 +1222,74 @@ export const TelegramCommand = effectCmd({
         return
       }
 
+      // ── New session from /sessions picker ────────────────────────
+      if (data === "sess:new") {
+        safe(async () => {
+          const sid = await createSession(cid)
+          if (!sid) { await reply(cid, "❌ Failed to create session."); return }
+          const newState = getActiveSession(cid)
+          const title = newState ? `\`${sid.slice(0, 8)}…\`` : sid.slice(0, 8)
+          await reply(cid, `✅ New session created and active: ${title}`)
+        }, "sess new handler")
+        return
+      }
+
       // ── Session switch from /sessions list ───────────────────────
+      // Multi-session: the click might be for the active session
+      // (no-op) or any other session the chat owns. If the session
+      // id isn't in this chat, it could be a session the user saw
+      // from a different chat — fetch and import it as a new
+      // session in this chat instead of erroring.
       if (data.startsWith("sess:")) {
         const parts = data.split(":")
         if (parts.length !== 3 || parts[1] !== "switch") return
         const newId = parts[2]
         safe(async () => {
-          const ver = await client.session.get({ path: { id: newId } }).catch(() => null)
-          if (!ver || (ver as any).error) {
-            await reply(cid, `❌ Session not found: ${newId.slice(0, 8)}…`)
+          // No-op if already active in this chat.
+          if (getActiveSession(cid)?.sessionId === newId) {
+            await reply(cid, `Already on \`${newId.slice(0, 8)}…\``)
             return
           }
-          sessions.set(cid, { sessionId: newId, lastSent: null, lastReasoning: null, userPrompt: null, streamMsgId: null, lastStreamEdit: null, inflight: false, inflightWait: null, inflightWaitTimer: null })
+          // If the session is already known to this chat, just
+          // promote it to active. Otherwise verify the session
+          // exists server-side and import it.
+          let state = getSession(cid, newId)
+          let title = "(untitled)"
+          if (!state) {
+            const ver = await client.session.get({ path: { id: newId } }).catch(() => null)
+            const verData = ver as { error?: unknown; data?: SessionLike } | null
+            if (!ver || verData?.error || !verData?.data) {
+              await reply(cid, `❌ Session not found: ${newId.slice(0, 8)}…`)
+              return
+            }
+            title = verData.data.title ?? "(untitled)"
+            state = { sessionId: newId, lastSent: null, lastReasoning: null, userPrompt: null, streamMsgId: null, lastStreamEdit: null, inflight: false, inflightWait: null, inflightWaitTimer: null }
+            // makeActive=true so addSession switches the active id.
+            addSession(cid, state)
+          } else {
+            setActiveSession(cid, newId)
+            // Pull the title for the active session so the user sees
+            // it in the confirmation. We do this in the background;
+            // it's a small request and the user has just clicked
+            // a button, so a beat of latency is fine.
+            const ver = await client.session.get({ path: { id: newId } }).catch(() => null)
+            const verData = ver as { error?: unknown; data?: SessionLike } | null
+            if (ver && !verData?.error && verData?.data) title = verData.data.title ?? "(untitled)"
+          }
+          // Reset per-session stream/inflight bookkeeping on switch
+          // so a freshly-activated session starts clean.
+          if (state) {
+            state.streamMsgId = null
+            state.lastStreamEdit = null
+            state.inflight = false
+            state.userPrompt = null
+            state.lastSent = null
+            state.lastReasoning = null
+            if (state.inflightWaitTimer) clearTimeout(state.inflightWaitTimer)
+            state.inflightWait = null
+            state.inflightWaitTimer = null
+          }
           stopTyping(cid)
-          const title = (ver as any).data?.title ?? "(untitled)"
           await reply(cid, `✅ Switched to \`${newId.slice(0, 8)}…\` — ${trunc(title, 40)}`)
         }, "sess switch handler")
         return
@@ -1047,7 +1345,7 @@ export const TelegramCommand = effectCmd({
                 const props = ev.properties as { sessionID: string; status: { type: string } }
                 const cid = chatOf(props.sessionID)
                 if (cid) {
-                  const s = sessions.get(cid)
+                  const s = getActiveSession(cid)
                   if (s) {
                     if (props.status?.type === "idle") {
                       // Close any in-flight stream so the next turn starts
@@ -1095,7 +1393,7 @@ export const TelegramCommand = effectCmd({
                 if (!sid) continue
                 const cid = chatOf(sid)
                 if (!cid) continue
-                const s = sessions.get(cid)
+                const s = getActiveSession(cid)
                 if (s) {
                   s.lastSent = null
                   s.lastReasoning = null
@@ -1132,7 +1430,7 @@ export const TelegramCommand = effectCmd({
                 log.debug("permission.asked", { perm })
                 const cid = chatOf(perm.sessionID)
                 if (!cid) {
-                  log.debug("permission session not found in sessions map", { knownSessionIds: [...sessions.values()].map(s => s.sessionId) })
+                  log.debug("permission session not found in sessions map", { knownSessionIds: [...sessionToChat.keys()] })
                   continue
                 }
 
@@ -1194,7 +1492,7 @@ export const TelegramCommand = effectCmd({
               const part = ev.properties.part
               const cid = chatOf(part.sessionID as string)
               if (!cid) continue
-              const s = sessions.get(cid)
+              const s = getActiveSession(cid)
               if (!s) continue
 
               if (part.type === "text") {

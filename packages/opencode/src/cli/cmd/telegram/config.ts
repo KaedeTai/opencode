@@ -3,34 +3,28 @@ import fs from "fs"
 import { Database as BunDB } from "bun:sqlite"
 import { getConfigDir, getDbPath } from "./paths"
 
-// Model catalog for /model. The v2 server has no /config endpoint
-// (verified: GET /v2/config → 404, /v1/config → 400), so we can't ask
-// the server. Curated to only the providers Kaede uses:
-//   oMLX    — local OpenAI-compatible server on :8000, fast local
-//             inference on Apple Silicon. Provider id is the literal
-//             string "omlx" because the server picks providers up
-//             from `provider: { "<id>": {...} }` in opencode.jsonc.
-//   anthropic — actually minimax via ANTHROPIC_BASE_URL env
-//             (https://api.minimaxi.com/anthropic). When that env is
-//             set, the opencode server routes all `anthropic/*`
-//             models through minimax's Anthropic-compatible API.
-//             So /model has to advertise models under the
-//             `anthropic/` provider prefix even though the endpoint
-//             is minimax. Model name "MiniMax-M3" is the literal
-//             API model id the server forwards.
-export type ModelEntry = { providerID: string; modelID: string; name: string }
+export type ModelEntry = {
+  providerID: string
+  modelID: string
+  name: string
+  contextLimit: number | null
+}
 
-const KNOWN_PROVIDERS: ModelEntry[] = [
-  { providerID: "omlx", modelID: "Qwen3.6-35B-A3B-Claude-4.7-Opus-Reasoning-Distilled-MLX-oQ4-MTP", name: "oMLX · Qwen 3.6 35B" },
-  { providerID: "anthropic", modelID: "MiniMax-M3", name: "MiniMax · MiniMax-M3 (1M ctx, via anthropic route)" },
-  { providerID: "anthropic", modelID: "MiniMax-M2.7-highspeed", name: "MiniMax · MiniMax-M2.7 highspeed" },
-  { providerID: "anthropic", modelID: "MiniMax-M2.7", name: "MiniMax · MiniMax-M2.7 (200K ctx)" },
+// Last-resort fallback used when the server's /config/providers
+// endpoint is unreachable. Kept intentionally small — the dynamic
+// catalog (built from the server) is the primary source.
+const STATIC_FALLBACK: ModelEntry[] = [
+  { providerID: "omlx", modelID: "Qwen3.6-35B-A3B-Claude-4.7-Opus-Reasoning-Distilled-MLX-oQ4-MTP", name: "oMLX · Qwen 3.6 35B", contextLimit: null },
+  { providerID: "anthropic", modelID: "MiniMax-M3", name: "MiniMax · MiniMax-M3 (1M ctx, via anthropic route)", contextLimit: 1_000_000 },
+  { providerID: "anthropic", modelID: "MiniMax-M2.7-highspeed", name: "MiniMax · MiniMax-M2.7 highspeed", contextLimit: 204_800 },
+  { providerID: "anthropic", modelID: "MiniMax-M2.7", name: "MiniMax · MiniMax-M2.7 (200K ctx)", contextLimit: 204_800 },
 ]
 
-// Per-model context limits. Used by /status to show a percentage
-// readout. Keep in sync with the actual model — wrong values here
-// just mislead the user, they don't break anything.
-const MODEL_CONTEXT_LIMITS: Record<string, number> = {
+// Per-model context limit overrides for the static fallback. The
+// dynamic catalog already carries limits from the server; this map
+// is only consulted when the server endpoint is unreachable AND
+// the static fallback already lacks a contextLimit.
+const STATIC_CONTEXT_LIMITS: Record<string, number> = {
   "MiniMax-M3": 1_000_000,
   "MiniMax-M2.7": 204_800,
   "MiniMax-M2.7-highspeed": 204_800,
@@ -43,15 +37,57 @@ const MODEL_CONTEXT_LIMITS: Record<string, number> = {
   "claude-opus-4-6": 200_000,
 }
 
-export function getModelCatalog(): ModelEntry[] {
-  return KNOWN_PROVIDERS
+export function getStaticModelCatalog(): ModelEntry[] {
+  return STATIC_FALLBACK
 }
 
-export function modelContextLimit(modelID: string): number | null {
-  return MODEL_CONTEXT_LIMITS[modelID] ?? null
+export function staticContextLimit(modelID: string): number | null {
+  return STATIC_CONTEXT_LIMITS[modelID] ?? null
 }
 
-// Resolve a user query against the catalog. Strict match on
+// Build the model catalog from the server's /config/providers endpoint.
+// Returns the dynamic catalog on success, or the static fallback if
+// the server is unreachable. The dynamic catalog is preferred because
+// it carries accurate context limits and reflects the user's current
+// opencode.json + env configuration.
+export async function getModelCatalog(client: any): Promise<ModelEntry[]> {
+  try {
+    const res = await client.config.providers()
+    if (res.error || !res.data) return STATIC_FALLBACK
+    const entries: ModelEntry[] = []
+    for (const provider of res.data.providers as Array<{
+      id: string
+      models: Record<string, { id?: string; name: string; limit?: { context?: number } }>
+    }>) {
+      for (const [modelKey, model] of Object.entries(provider.models)) {
+        entries.push({
+          providerID: provider.id,
+          modelID: model.id ?? modelKey,
+          name: model.name,
+          contextLimit: model.limit?.context ?? null,
+        })
+      }
+    }
+    if (entries.length > 0) return entries
+  } catch {}
+  return STATIC_FALLBACK
+}
+
+// Look up a model's context window size. Tries the dynamic catalog
+// first (so it stays in sync with what the server actually exposes),
+// then the static context-limit map, then null.
+export async function getModelContextLimit(
+  client: any,
+  providerID: string,
+  modelID: string,
+): Promise<number | null> {
+  const catalog = await getModelCatalog(client)
+  const entry = catalog.find((c) => c.providerID === providerID && c.modelID === modelID)
+  if (entry?.contextLimit) return entry.contextLimit
+  return staticContextLimit(modelID)
+}
+
+// Resolve a user query against a catalog. Strict match on
 // "providerID/modelID", then prefix/suffix match on modelID,
 // then case-insensitive name contains. Returns undefined if no hit.
 export function resolveModel(query: string, catalog: ModelEntry[]): ModelEntry | undefined {
@@ -67,6 +103,16 @@ export function resolveModel(query: string, catalog: ModelEntry[]): ModelEntry |
   if (suffix) return suffix
   const lower = q.toLowerCase()
   return catalog.find((c) => c.name.toLowerCase().includes(lower))
+}
+
+// Narrow view of the opencode config file. The bot only reads three
+// fields: a top-level `model` string and a `provider` record whose
+// entries may carry a `model` string. Everything else (theme,
+// keybinds, mcp, etc.) is irrelevant to the bot and stays opaque.
+type OpencodeConfig = {
+  $schema?: string
+  model?: string
+  provider?: Record<string, { model?: string }>
 }
 
 // Get the currently active default model from env or user config.
@@ -95,7 +141,7 @@ export function getCurrentModel(): { providerID: string; modelID: string } | nul
       const stripped = name.endsWith(".jsonc")
         ? raw.replace(/^\s*\/\/.*$/gm, "").replace(/\/\*[\s\S]*?\*\//g, "")
         : raw
-      const cfg = JSON.parse(stripped) as any
+      const cfg = JSON.parse(stripped) as OpencodeConfig
       // Prefer the flat `model: "provider/model"` (set by
       // setDefaultModel and by opencode itself). Fall back to
       // scanning the provider Record<providerID, ProviderConfig>
@@ -151,7 +197,7 @@ export function setDefaultModel(
             .replace(/^\s*\/\/.*$/gm, "")
             .replace(/\/\*[\s\S]*?\*\//g, "")
         : raw
-      const cfg = JSON.parse(stripped) as any
+      const cfg = JSON.parse(stripped) as OpencodeConfig
       // Opencode config schema: `provider` is a Record<providerID,
       // ProviderConfig> where ProviderConfig has `model` and
       // `options` (no flat `id` field — the key IS the provider id).
@@ -211,9 +257,16 @@ export type SessionTokenUsage = {
 //   { total, input, output, reasoning, cache: { read, write } }
 //
 // WAL mode is on, so we open a separate readonly connection and
-// read the latest assistant row by time_created. We also pull the
-// model's contextLimit from the provider/model config so the
-// percentage readout is meaningful.
+// read the latest assistant row by time_created.
+//
+// TODO(item 11): replace with a server endpoint
+//   GET /session/:id/tokens → { total, input, output, reasoning, cache }
+// that wraps this DB query server-side. The bot should then call
+// via SDK (or direct fetch on the v2 surface) and drop getDbPath
+// + the Database import here. Until then this is a stopgap that
+// replicates packages/core/src/database/path() inline because the
+// bot's process shouldn't pull in the full Database effect layer.
+// If the server's schema changes, this will silently return null.
 export function getSessionTokens(sessionID: string): SessionTokenUsage | null {
   let db: BunDB | null = null
   try {
@@ -246,10 +299,6 @@ export function getSessionTokens(sessionID: string): SessionTokenUsage | null {
     }
     const t = msg.tokens
     if (!t) return null
-    // Look up the model's context limit from the live config so
-    // the percentage readout means something.
-    const cur = getCurrentModel()
-    const limit = cur ? modelContextLimit(cur.modelID) : null
     return {
       total: t.total ?? 0,
       input: t.input ?? 0,
@@ -257,7 +306,9 @@ export function getSessionTokens(sessionID: string): SessionTokenUsage | null {
       reasoning: t.reasoning ?? 0,
       cacheRead: t.cache?.read ?? 0,
       cacheWrite: t.cache?.write ?? 0,
-      modelContextLimit: limit,
+      // Caller fills this in from the dynamic catalog after the
+      // fact — getSessionTokens stays sync to keep DB access simple.
+      modelContextLimit: null,
     }
   } catch {
     return null
