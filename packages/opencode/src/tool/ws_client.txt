@@ -51,8 +51,9 @@ Usage notes:
   60s, max 5 minutes). Long-running tasks should use
   `detached: true` instead of bumping the timeout.
 - `detached: true` returns a `task_id` and a `resultFile`
-  path immediately. The worker writes
-  `{ ok, sessionId, text, tools, patches, reasoning, lastError }`
-  to that file when the peer goes idle. Poll with the
-  `read` tool. The default timeout for detached work is
-  5 minutes; longer tasks need a manual `bun` script.
+  path immediately. The job runs in-process via the
+  opencode BackgroundJob registry — fetch the result
+  by calling `ws_client({ taskId })` (optionally with
+  `timeout` in seconds; default 60, max 300). The
+  `resultFile` is also written for external observers,
+  but polling the file is no longer required.

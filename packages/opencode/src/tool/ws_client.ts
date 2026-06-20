@@ -1,6 +1,7 @@
 import { Effect, Schema } from "effect"
 import { spawn, type Subprocess } from "bun"
 import * as Tool from "./tool"
+import * as BackgroundJob from "@/background/job"
 import DESCRIPTION from "./ws_client.txt"
 import * as fs from "node:fs/promises"
 import * as path from "node:path"
@@ -62,7 +63,11 @@ export const Parameters = Schema.Struct({
   }),
   detached: Schema.optional(Schema.Boolean).annotate({
     description:
-      "Fire-and-forget mode. Spawns a background worker, returns a task_id immediately, and writes the result to ~/.config/opencode/peer-tasks/<task_id>.json when done. Use this when the sub-agent should run in parallel with the current work.",
+      "Fire-and-forget mode. Starts a background job via opencode's BackgroundJob registry, returns a task_id immediately. The job's final output is also written to ~/.config/opencode/peer-tasks/<task_id>.json for external observers. Fetch the result later by calling ws_client again with taskId=<id> (and optionally timeout + wait).",
+  }),
+  taskId: Schema.optional(Schema.String).annotate({
+    description:
+      "Fetch the result of a previously-started detached task. Blocks up to `timeout` seconds (default 60, max 300). If the task is still running, returns a 'still running' message — call again with a longer timeout. Mutually exclusive with prompt/url/sessionId.",
   }),
   autoStart: Schema.optional(Schema.Boolean).annotate({
     description:
@@ -93,11 +98,58 @@ type ResolvedParams = {
 export const WsClientTool = Tool.define(
   "ws_client",
   Effect.gen(function* () {
+    const background = yield* BackgroundJob.Service
     return {
       description: DESCRIPTION,
       parameters: Parameters,
       execute: (params: Schema.Schema.Type<typeof Parameters>, ctx: Tool.Context) =>
         Effect.gen(function* () {
+          // taskId path: wait for a previously-started detached job.
+          // Mutually exclusive with the prompt path.
+          if (params.taskId) {
+            if (params.prompt || params.url || params.sessionId) {
+              return yield* Effect.fail(
+                new Error("taskId is mutually exclusive with prompt/url/sessionId"),
+              )
+            }
+            const waitMs = Math.min(
+              (params.timeout ?? DEFAULT_TIMEOUT / 1000) * 1000,
+              MAX_TIMEOUT,
+            )
+            const result = yield* background.wait({ id: params.taskId, timeout: waitMs })
+            if (result.timedOut) {
+              return {
+                title: `Peer task ${params.taskId.slice(0, 8)} still running`,
+                output:
+                  `Background task is still running after ${waitMs / 1000}s. ` +
+                  `Call ws_client again with taskId=${params.taskId} and a longer timeout.`,
+                metadata: {
+                  url: "",
+                  sessionId: "",
+                  durationMs: waitMs,
+                  textChunks: 0,
+                  eventsReceived: 0,
+                  taskId: params.taskId,
+                },
+              }
+            }
+            const info = result.info
+            const meta = (info?.metadata ?? {}) as Record<string, unknown>
+            const text = info?.output ?? ""
+            const status = info?.status ?? "unknown"
+            return {
+              title: `Peer task ${params.taskId.slice(0, 8)} ${status}`,
+              output: text || `(task ${status}, no output)`,
+              metadata: {
+                url: (meta.url as string) ?? "",
+                sessionId: (meta.sessionId as string) ?? "",
+                durationMs: (meta.durationMs as number) ?? 0,
+                textChunks: (meta.textChunks as number) ?? 0,
+                eventsReceived: (meta.eventsReceived as number) ?? 0,
+              },
+            }
+          }
+
           const url = resolveUrl(params.url)
           if (!url.startsWith("ws://") && !url.startsWith("wss://")) {
             throw new Error(`url must start with ws:// or wss://, got: ${url}`)
@@ -130,7 +182,27 @@ export const WsClientTool = Tool.define(
           }
 
           if (resolved.detached) {
-            const { taskId, resultFile } = yield* Effect.promise(() => runDetached(resolved))
+            const taskId = crypto.randomUUID()
+            const resultFile = path.join(TASK_DIR, `${taskId}.json`)
+            yield* Effect.promise(() => fs.mkdir(TASK_DIR, { recursive: true }))
+
+            // The job's `run` is an in-process Effect — replaces
+            // the old Bun.spawn worker. Output is the peer's
+            // text; failures land in info.error. The result
+            // file is written for external observers but is no
+            // longer the primary delivery channel.
+            const run = buildDetachedRunEffect(resolved, resultFile)
+            yield* background.start({
+              id: taskId,
+              type: "ws_client",
+              title: `Peer @ ${hostOf(url)}`,
+              metadata: {
+                url,
+                prompt: resolved.prompt.slice(0, 200),
+                sessionId: resolved.sessionId,
+              },
+              run,
+            })
             return {
               title: `Detached task @ ${hostOf(url)} (${taskId.slice(0, 8)})`,
               output:
@@ -138,8 +210,8 @@ export const WsClientTool = Tool.define(
                 `  task_id:     ${taskId}\n` +
                 `  result:      ${resultFile}\n` +
                 `  url:         ${url}\n` +
-                `  poll with:   read ${resultFile}\n` +
-                `The peer is running in the background. Continue with other work; check the file when the task is likely done (tool-using LLMs take 30s – 5min).`,
+                `  wait via:    ws_client({ taskId: "${taskId}", timeout: <seconds> })\n` +
+                `The peer is running in the background. Continue with other work; call ws_client again with taskId to fetch the result.`,
               metadata: {
                 url,
                 sessionId: resolved.sessionId ?? "(will be created)",
@@ -490,147 +562,53 @@ function urlPort(url: string): number {
   }
 }
 
-// Detached (fire-and-forget) path. Spawns an inline bun script that
-// does the same WS interaction as runPrompt but writes the result to
-// a file instead of returning it. The main call returns a task_id
-// immediately; the agent polls the file when it wants the answer.
-async function runDetached(params: ResolvedParams): Promise<{ taskId: string; resultFile: string }> {
-  const taskId = crypto.randomUUID()
-  await fs.mkdir(TASK_DIR, { recursive: true })
-  const resultFile = path.join(TASK_DIR, `${taskId}.json`)
-
-  // Args: url prompt sessionId resultFile sessionFile timeoutMs
-  const args = [
-    params.url,
-    params.prompt,
-    params.sessionId ?? "",
-    resultFile,
-    SESSION_FILE,
-    String(params.timeoutMs),
-  ].map((a) => a.replace(/[^\w./:=?-]/g, (c) => encodeURIComponent(c)))
-
-  spawn({
-    cmd: ["bun", "run", "-e", DETACHED_WORKER, "--", ...args],
-    stdout: "ignore",
-    stderr: "ignore",
-  })
-
-  return { taskId, resultFile }
-}
-
-// Standalone worker. Uses bun's built-in WebSocket + Bun.write to
-// mirror runPrompt. Kept inline so the dist binary needs no
-// sibling files.
-const DETACHED_WORKER = `
-const url = process.argv[2]
-const prompt = process.argv[3]
-const wantSession = process.argv[4]
-const resultFile = process.argv[5]
-const sessionFile = process.argv[6]
-const timeoutMs = parseInt(process.argv[7] || "300000", 10)
-
-async function loadSession() {
-  if (wantSession) return wantSession
-  try {
-    const f = await Bun.file(sessionFile).json()
-    return f.sessionId || null
-  } catch { return null }
-}
-async function saveSession(id) {
-  try {
-    await Bun.write(sessionFile, JSON.stringify({ sessionId: id, updatedAt: new Date().toISOString() }, null, 2))
-  } catch {}
-}
-function openSocket() {
-  return new Promise((resolve, reject) => {
-    let s = false
-    const ws = new WebSocket(url)
-    ws.addEventListener("open", () => { if (s) return; s = true; ws.removeEventListener("error", onErr); resolve(ws) }, { once: true })
-    function onErr(e) { if (s) return; s = true; reject(new Error("ws: " + (e?.message || e?.type || "?"))) }
-    ws.addEventListener("error", onErr, { once: true })
-  })
-}
-function next(ws, pred) {
-  return new Promise((resolve, reject) => {
-    function onMsg(ev) {
-      let m
-      try { m = JSON.parse(String(ev.data)) } catch { return }
-      if (m.type === "pong") return
-      if (!pred(m)) return
-      ws.removeEventListener("message", onMsg)
-      ws.removeEventListener("error", onErr)
-      resolve(m)
+// Detached (fire-and-forget) path. Builds an in-process Effect
+// that does the same WS interaction as runPrompt, writes the
+// result to a file for external observers, and returns the
+// peer's text as the job's output. BackgroundJob.start runs the
+// Effect in the parent process — no subprocess, no polling.
+// The main call returns a task_id immediately; the agent uses
+// ws_client({ taskId }) to wait.
+function buildDetachedRunEffect(
+  params: ResolvedParams,
+  resultFile: string,
+): Effect.Effect<string, unknown> {
+  return Effect.gen(function* () {
+    const started = Date.now()
+    const result = yield* Effect.promise(() => runPrompt(params))
+    const durationMs = Date.now() - started
+    const payload = {
+      ok: true,
+      sessionId: result.metadata.sessionId,
+      url: result.metadata.url,
+      durationMs,
+      textChunks: result.metadata.textChunks,
+      eventsReceived: result.metadata.eventsReceived,
+      text: result.output,
+      finishedAt: new Date().toISOString(),
     }
-    function onErr(e) { ws.removeEventListener("message", onMsg); reject(new Error("ws: " + (e?.message || "?"))) }
-    ws.addEventListener("message", onMsg)
-    ws.addEventListener("error", onErr)
-  })
+    yield* Effect.promise(() =>
+      fs.writeFile(resultFile, JSON.stringify(payload, null, 2)).catch(() => undefined),
+    )
+    return result.output
+  }).pipe(
+    Effect.tapError((e: unknown) =>
+      Effect.promise(() =>
+        fs
+          .writeFile(
+            resultFile,
+            JSON.stringify(
+              {
+                ok: false,
+                error: e instanceof Error ? e.message : String(e),
+                finishedAt: new Date().toISOString(),
+              },
+              null,
+              2,
+            ),
+          )
+          .catch(() => undefined),
+      ),
+    ),
+  )
 }
-
-const writeResult = (data) => Bun.write(resultFile, JSON.stringify(data, null, 2))
-
-const timer = setTimeout(() => writeResult({ ok: false, error: "timeout", timeoutMs }), timeoutMs)
-try {
-  const ws = await openSocket()
-  const welcome = await next(ws, (m) => m.type === "welcome")
-  if (welcome.type !== "welcome") throw new Error("no welcome")
-  let sessionId = await loadSession()
-  if (sessionId) {
-    ws.send(JSON.stringify({ type: "switch_session", sessionId }))
-    const r = await next(ws, (m) => m.type === "session_switched" || m.type === "error")
-    if (r.type === "error") {
-      ws.send(JSON.stringify({ type: "new_session" }))
-      const c = await next(ws, (m) => m.type === "session_created" || m.type === "error")
-      if (c.type === "error") throw new Error("new_session: " + c.message)
-      sessionId = c.sessionId
-    } else { sessionId = r.sessionId }
-  } else {
-    ws.send(JSON.stringify({ type: "new_session" }))
-    const c = await next(ws, (m) => m.type === "session_created" || m.type === "error")
-    if (c.type === "error") throw new Error("new_session: " + c.message)
-    sessionId = c.sessionId
-  }
-  if (!wantSession) await saveSession(sessionId)
-  ws.send(JSON.stringify({ type: "prompt", sessionId, text: prompt }))
-  const acc = await next(ws, (m) => m.type === "prompt_accepted" || m.type === "prompt_rejected" || m.type === "error")
-  if (acc.type !== "prompt_accepted") throw new Error("prompt not accepted: " + acc.type)
-  const text = []
-  const tools = []
-  const patches = []
-  const reason = []
-  let events = 0
-  let lastErr = null
-  let done = false
-  while (!done) {
-    const ev = await next(ws, () => true)
-    events++
-    if (ev.type !== "event") continue
-    const inner = ev.event
-    if (inner.type === "message.part.updated") {
-      const p = inner.properties?.part
-      if (!p || p.sessionID !== sessionId) continue
-      if (p.type === "text" && p.text) text.push(p.text)
-      else if (p.type === "tool" && p.state?.title) tools.push(p.tool + ": " + p.state.title)
-      else if (p.type === "reasoning" && p.text) reason.push("(" + p.text.length + " chars)")
-      else if (p.type === "patch" && p.files) for (const f of p.files) patches.push(f.path + " (+" + (f.additions||0) + "/-" + (f.deletions||0) + ")")
-    } else if (inner.type === "session.error") {
-      const e = inner.properties?.error
-      lastErr = (e?.name || "Error") + ": " + (e?.message || "unknown")
-    } else if (inner.type === "session.status" && inner.properties?.status?.type === "idle") {
-      done = true
-    }
-  }
-  clearTimeout(timer)
-  try { ws.close() } catch {}
-  await writeResult({
-    ok: true, sessionId, url, eventsReceived: events, textChunks: text.length,
-    text: text.join(""),
-    tools, patches, reasoning: reason, lastError: lastErr,
-    finishedAt: new Date().toISOString(),
-  })
-} catch (e) {
-  clearTimeout(timer)
-  await writeResult({ ok: false, error: String(e?.message || e), finishedAt: new Date().toISOString() })
-  process.exit(1)
-}
-`
