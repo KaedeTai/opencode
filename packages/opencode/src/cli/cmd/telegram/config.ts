@@ -2,6 +2,7 @@ import path from "path"
 import fs from "fs"
 import { Database as BunDB } from "bun:sqlite"
 import { getConfigDir, getDbPath } from "./paths"
+import type { OpencodeClient } from "@opencode-ai/sdk"
 
 export type ModelEntry = {
   providerID: string
@@ -50,7 +51,7 @@ export function staticContextLimit(modelID: string): number | null {
 // the server is unreachable. The dynamic catalog is preferred because
 // it carries accurate context limits and reflects the user's current
 // opencode.json + env configuration.
-export async function getModelCatalog(client: any): Promise<ModelEntry[]> {
+export async function getModelCatalog(client: OpencodeClient): Promise<ModelEntry[]> {
   try {
     const res = await client.config.providers()
     if (res.error || !res.data) return STATIC_FALLBACK
@@ -77,7 +78,7 @@ export async function getModelCatalog(client: any): Promise<ModelEntry[]> {
 // first (so it stays in sync with what the server actually exposes),
 // then the static context-limit map, then null.
 export async function getModelContextLimit(
-  client: any,
+  client: OpencodeClient,
   providerID: string,
   modelID: string,
 ): Promise<number | null> {
