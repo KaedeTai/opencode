@@ -1,9 +1,28 @@
 import { Effect, Schema } from "effect"
+import { spawn, type Subprocess } from "bun"
 import * as Tool from "./tool"
 import DESCRIPTION from "./ws_client.txt"
+import * as fs from "node:fs/promises"
+import * as path from "node:path"
+import * as os from "node:os"
 
 const DEFAULT_TIMEOUT = 60_000
 const MAX_TIMEOUT = 5 * 60_000
+
+// Default peer URL. Override with WEBSOCKET_BRIDGE_URL when the bridge is
+// running on a non-default port or host. The bridge is the long-lived
+// `opencode websocket` process spawned by scripts/ws-spawn-keepalive.ts.
+const DEFAULT_URL = process.env.WEBSOCKET_BRIDGE_URL ?? "ws://127.0.0.1:9999/ws"
+
+// On the opencode host we keep a single "last used" session id so repeated
+// calls inside the same workspace share the peer's context (history,
+// working dir, etc.) without the caller having to track it.
+const SESSION_FILE = path.join(os.homedir(), ".config", "opencode", "peer-session.json")
+
+// Where detached (fire-and-forget) tasks write their result. The file name
+// is the task id; the agent reads it back with the `read` tool when it's
+// ready to look at the result.
+const TASK_DIR = path.join(os.homedir(), ".config", "opencode", "peer-tasks")
 
 // Wire-protocol messages we send + accept. Kept narrow on
 // purpose: anything the WS bridge emits that we don't use
@@ -27,17 +46,27 @@ type ServerMessage =
   | { type: "pong" }
 
 export const Parameters = Schema.Struct({
-  url: Schema.String.annotate({
-    description: "WebSocket URL of the peer opencode (e.g. ws://host:9999/ws)",
+  url: Schema.optional(Schema.String).annotate({
+    description:
+      "WebSocket URL of the peer opencode. Defaults to $WEBSOCKET_BRIDGE_URL or ws://127.0.0.1:9999/ws. Start the bridge once with `bun run scripts/ws-spawn-keepalive.ts` and it stays up between calls.",
   }),
   prompt: Schema.String.annotate({
-    description: "The prompt to send to the peer",
+    description: "The prompt to send to the peer.",
   }),
   sessionId: Schema.optional(Schema.String).annotate({
-    description: "Optional target session id on the peer. If omitted, a new session is created.",
+    description:
+      "Optional target session id on the peer. If omitted, the last-used session from ~/.config/opencode/peer-session.json is reused, or a new session is created.",
   }),
   timeout: Schema.optional(Schema.Number).annotate({
-    description: "Timeout in seconds (max 300, default 60)",
+    description: "Timeout in seconds (max 300, default 60). Ignored when detached=true.",
+  }),
+  detached: Schema.optional(Schema.Boolean).annotate({
+    description:
+      "Fire-and-forget mode. Spawns a background worker, returns a task_id immediately, and writes the result to ~/.config/opencode/peer-tasks/<task_id>.json when done. Use this when the sub-agent should run in parallel with the current work.",
+  }),
+  autoStart: Schema.optional(Schema.Boolean).annotate({
+    description:
+      "If true and the bridge isn't reachable, spawn it in the background (same as running scripts/ws-spawn-keepalive.ts) and wait for /health. Default false; the tool will surface a clear error if the bridge is down.",
   }),
 })
 
@@ -47,6 +76,18 @@ type Metadata = {
   durationMs: number
   textChunks: number
   eventsReceived: number
+  detached?: boolean
+  taskId?: string
+  resultFile?: string
+}
+
+type ResolvedParams = {
+  url: string
+  prompt: string
+  sessionId?: string
+  timeoutMs: number
+  detached: boolean
+  autoStart: boolean
 }
 
 export const WsClientTool = Tool.define(
@@ -57,30 +98,86 @@ export const WsClientTool = Tool.define(
       parameters: Parameters,
       execute: (params: Schema.Schema.Type<typeof Parameters>, ctx: Tool.Context) =>
         Effect.gen(function* () {
-          if (!params.url.startsWith("ws://") && !params.url.startsWith("wss://")) {
-            throw new Error("url must start with ws:// or wss://")
+          const url = resolveUrl(params.url)
+          if (!url.startsWith("ws://") && !url.startsWith("wss://")) {
+            throw new Error(`url must start with ws:// or wss://, got: ${url}`)
           }
-          const timeoutMs = Math.min((params.timeout ?? DEFAULT_TIMEOUT / 1000) * 1000, MAX_TIMEOUT)
+          const timeoutMs = Math.min(
+            (params.timeout ?? DEFAULT_TIMEOUT / 1000) * 1000,
+            MAX_TIMEOUT,
+          )
 
           // Permission gate. Localhost is implicit-allow (the
           // same trust model webfetch uses); anything else
           // asks the user first.
-          const isLocal = /^ws:\/\/(localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1?\])(:\d+)?/.test(params.url)
+          const isLocal = /^ws:\/\/(localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1?\])(:\d+)?/.test(url)
           if (!isLocal) {
             yield* ctx.ask({
               permission: "ws_client",
-              patterns: [params.url],
+              patterns: [url],
               always: ["ws://localhost*", "ws://127.0.0.1*", "ws://[::1]*"],
-              metadata: { url: params.url, prompt: params.prompt.slice(0, 200) },
+              metadata: { url, prompt: params.prompt.slice(0, 200) },
             })
           }
 
+          const resolved: ResolvedParams = {
+            url,
+            prompt: params.prompt,
+            sessionId: params.sessionId ?? (yield* Effect.promise(() => loadPersistedSession())),
+            timeoutMs,
+            detached: params.detached ?? false,
+            autoStart: params.autoStart ?? false,
+          }
+
+          if (resolved.detached) {
+            const { taskId, resultFile } = yield* Effect.promise(() => runDetached(resolved))
+            return {
+              title: `Detached task @ ${hostOf(url)} (${taskId.slice(0, 8)})`,
+              output:
+                `Detached task started.\n` +
+                `  task_id:     ${taskId}\n` +
+                `  result:      ${resultFile}\n` +
+                `  url:         ${url}\n` +
+                `  poll with:   read ${resultFile}\n` +
+                `The peer is running in the background. Continue with other work; check the file when the task is likely done (tool-using LLMs take 30s – 5min).`,
+              metadata: {
+                url,
+                sessionId: resolved.sessionId ?? "(will be created)",
+                durationMs: 0,
+                textChunks: 0,
+                eventsReceived: 0,
+                detached: true,
+                taskId,
+                resultFile,
+              },
+            }
+          }
+
+          // Sync path: optionally auto-start the bridge.
+          if (resolved.autoStart && !(yield* Effect.promise(() => isReachable(url)))) {
+            spawnBridge(url)
+            if (!(yield* Effect.promise(() => waitForReachable(url, 30_000)))) {
+              throw new Error(
+                `bridge at ${url} did not become healthy in 30s after autoStart; ` +
+                  `try running scripts/ws-spawn-keepalive.ts manually to see errors`,
+              )
+            }
+          }
+
           const started = Date.now()
-          const result = yield* Effect.promise(() => runPrompt(params, timeoutMs))
+          const result = yield* Effect.promise(() => runPrompt(resolved))
           const durationMs = Date.now() - started
+
+          // Persist the resolved session so future calls reuse it.
+          // Skip when the caller explicitly named a session — they may
+          // be doing one-off work and shouldn't pollute the default.
+          if (!params.sessionId) {
+            yield* Effect.promise(() => savePersistedSession(result.metadata.sessionId))
+          }
+
           yield* ctx.metadata({ metadata: { ...result.metadata, durationMs } })
           return {
-            title: `Asked peer @ ${hostOf(params.url)}`,
+            title: `Asked peer @ ${hostOf(url)}`,
             output: result.output,
             metadata: { ...result.metadata, durationMs },
           }
@@ -88,6 +185,31 @@ export const WsClientTool = Tool.define(
     }
   }),
 )
+
+function resolveUrl(input: string | undefined): string {
+  return input && input.length > 0 ? input : DEFAULT_URL
+}
+
+async function loadPersistedSession(): Promise<string | undefined> {
+  try {
+    const data = JSON.parse(await fs.readFile(SESSION_FILE, "utf-8")) as { sessionId?: string }
+    return typeof data.sessionId === "string" ? data.sessionId : undefined
+  } catch {
+    return undefined
+  }
+}
+
+async function savePersistedSession(sessionId: string): Promise<void> {
+  try {
+    await fs.mkdir(path.dirname(SESSION_FILE), { recursive: true })
+    await fs.writeFile(
+      SESSION_FILE,
+      JSON.stringify({ sessionId, updatedAt: new Date().toISOString() }, null, 2),
+    )
+  } catch {
+    // best-effort; never fail the tool call because of persistence
+  }
+}
 
 function hostOf(url: string): string {
   try {
@@ -102,11 +224,8 @@ type RunResult = {
   metadata: Metadata
 }
 
-async function runPrompt(
-  params: Schema.Schema.Type<typeof Parameters>,
-  timeoutMs: number,
-): Promise<RunResult> {
-  return withTimeout(timeoutMs, async () => {
+async function runPrompt(params: ResolvedParams): Promise<RunResult> {
+  return withTimeout(params.timeoutMs, async () => {
     const ws = await openSocket(params.url)
     try {
       // 1. Wait for the welcome so we know the server is up.
@@ -116,7 +235,8 @@ async function runPrompt(
       }
 
       // 2. Resolve the target session. Reuse one if the
-      // caller named it; otherwise create a fresh one.
+      // caller named it (or we persisted one); otherwise
+      // create a fresh one.
       let sessionId: string
       if (params.sessionId) {
         ws.send(JSON.stringify({ type: "switch_session", sessionId: params.sessionId } satisfies ClientMessage))
@@ -125,9 +245,20 @@ async function runPrompt(
           (m) => m.type === "session_switched" || m.type === "error",
         )
         if (switched.type === "error") {
-          throw new Error(`switch_session failed: ${switched.message}`)
+          // Persisted session is gone (bridge restarted, etc).
+          // Fall through to creating a new one rather than fail.
+          ws.send(JSON.stringify({ type: "new_session" } satisfies ClientMessage))
+          const created = await nextMessage<ServerMessage>(
+            ws,
+            (m) => m.type === "session_created" || m.type === "error",
+          )
+          if (created.type === "error") {
+            throw new Error(`new_session failed: ${created.message}`)
+          }
+          sessionId = (created as { sessionId: string }).sessionId
+        } else {
+          sessionId = (switched as { sessionId: string }).sessionId
         }
-        sessionId = (switched as { sessionId: string }).sessionId
       } else {
         ws.send(JSON.stringify({ type: "new_session" } satisfies ClientMessage))
         const created = await nextMessage<ServerMessage>(
@@ -281,7 +412,7 @@ function nextMessage<T extends ServerMessage>(
       let parsed: ServerMessage
       try {
         parsed = JSON.parse(String(event.data)) as ServerMessage
-      } catch (e) {
+      } catch {
         // Malformed frame — keep listening, the next
         // message might be the one we want.
         return
@@ -319,3 +450,187 @@ async function withTimeout<T>(ms: number, body: () => Promise<T>): Promise<T> {
     if (timer) clearTimeout(timer)
   }
 }
+
+function isReachable(url: string): Promise<boolean> {
+  const httpUrl = url.replace(/^ws/, "http").replace(/\/ws$/, "/health")
+  return fetch(httpUrl, { signal: AbortSignal.timeout(1500) })
+    .then((r) => r.ok)
+    .catch(() => false)
+}
+
+async function waitForReachable(url: string, ms: number): Promise<boolean> {
+  const deadline = Date.now() + ms
+  while (Date.now() < deadline) {
+    if (await isReachable(url)) return true
+    await new Promise((r) => setTimeout(r, 250))
+  }
+  return false
+}
+
+// Auto-start the bridge from the tool. Spawns the same process that
+// scripts/ws-spawn-keepalive.ts would, but inlined here so the dist
+// binary doesn't depend on the source tree at runtime. The child
+// becomes a session leader and survives tool completion.
+function spawnBridge(url: string): Subprocess {
+  const port = urlPort(url)
+  return spawn({
+    cmd: [process.execPath, "websocket", "--ws-port", String(port), "--hostname", "127.0.0.1"],
+    env: { ...process.env, OPENCODE_PRINT_LOGS: "0" },
+    detached: true,
+    stdout: "ignore",
+    stderr: "ignore",
+  })
+}
+
+function urlPort(url: string): number {
+  try {
+    return new URL(url).port ? parseInt(new URL(url).port, 10) : 9999
+  } catch {
+    return 9999
+  }
+}
+
+// Detached (fire-and-forget) path. Spawns an inline bun script that
+// does the same WS interaction as runPrompt but writes the result to
+// a file instead of returning it. The main call returns a task_id
+// immediately; the agent polls the file when it wants the answer.
+async function runDetached(params: ResolvedParams): Promise<{ taskId: string; resultFile: string }> {
+  const taskId = crypto.randomUUID()
+  await fs.mkdir(TASK_DIR, { recursive: true })
+  const resultFile = path.join(TASK_DIR, `${taskId}.json`)
+
+  // Args: url prompt sessionId resultFile sessionFile timeoutMs
+  const args = [
+    params.url,
+    params.prompt,
+    params.sessionId ?? "",
+    resultFile,
+    SESSION_FILE,
+    String(params.timeoutMs),
+  ].map((a) => a.replace(/[^\w./:=?-]/g, (c) => encodeURIComponent(c)))
+
+  spawn({
+    cmd: ["bun", "run", "-e", DETACHED_WORKER, "--", ...args],
+    stdout: "ignore",
+    stderr: "ignore",
+  })
+
+  return { taskId, resultFile }
+}
+
+// Standalone worker. Uses bun's built-in WebSocket + Bun.write to
+// mirror runPrompt. Kept inline so the dist binary needs no
+// sibling files.
+const DETACHED_WORKER = `
+const url = process.argv[2]
+const prompt = process.argv[3]
+const wantSession = process.argv[4]
+const resultFile = process.argv[5]
+const sessionFile = process.argv[6]
+const timeoutMs = parseInt(process.argv[7] || "300000", 10)
+
+async function loadSession() {
+  if (wantSession) return wantSession
+  try {
+    const f = await Bun.file(sessionFile).json()
+    return f.sessionId || null
+  } catch { return null }
+}
+async function saveSession(id) {
+  try {
+    await Bun.write(sessionFile, JSON.stringify({ sessionId: id, updatedAt: new Date().toISOString() }, null, 2))
+  } catch {}
+}
+function openSocket() {
+  return new Promise((resolve, reject) => {
+    let s = false
+    const ws = new WebSocket(url)
+    ws.addEventListener("open", () => { if (s) return; s = true; ws.removeEventListener("error", onErr); resolve(ws) }, { once: true })
+    function onErr(e) { if (s) return; s = true; reject(new Error("ws: " + (e?.message || e?.type || "?"))) }
+    ws.addEventListener("error", onErr, { once: true })
+  })
+}
+function next(ws, pred) {
+  return new Promise((resolve, reject) => {
+    function onMsg(ev) {
+      let m
+      try { m = JSON.parse(String(ev.data)) } catch { return }
+      if (m.type === "pong") return
+      if (!pred(m)) return
+      ws.removeEventListener("message", onMsg)
+      ws.removeEventListener("error", onErr)
+      resolve(m)
+    }
+    function onErr(e) { ws.removeEventListener("message", onMsg); reject(new Error("ws: " + (e?.message || "?"))) }
+    ws.addEventListener("message", onMsg)
+    ws.addEventListener("error", onErr)
+  })
+}
+
+const writeResult = (data) => Bun.write(resultFile, JSON.stringify(data, null, 2))
+
+const timer = setTimeout(() => writeResult({ ok: false, error: "timeout", timeoutMs }), timeoutMs)
+try {
+  const ws = await openSocket()
+  const welcome = await next(ws, (m) => m.type === "welcome")
+  if (welcome.type !== "welcome") throw new Error("no welcome")
+  let sessionId = await loadSession()
+  if (sessionId) {
+    ws.send(JSON.stringify({ type: "switch_session", sessionId }))
+    const r = await next(ws, (m) => m.type === "session_switched" || m.type === "error")
+    if (r.type === "error") {
+      ws.send(JSON.stringify({ type: "new_session" }))
+      const c = await next(ws, (m) => m.type === "session_created" || m.type === "error")
+      if (c.type === "error") throw new Error("new_session: " + c.message)
+      sessionId = c.sessionId
+    } else { sessionId = r.sessionId }
+  } else {
+    ws.send(JSON.stringify({ type: "new_session" }))
+    const c = await next(ws, (m) => m.type === "session_created" || m.type === "error")
+    if (c.type === "error") throw new Error("new_session: " + c.message)
+    sessionId = c.sessionId
+  }
+  if (!wantSession) await saveSession(sessionId)
+  ws.send(JSON.stringify({ type: "prompt", sessionId, text: prompt }))
+  const acc = await next(ws, (m) => m.type === "prompt_accepted" || m.type === "prompt_rejected" || m.type === "error")
+  if (acc.type !== "prompt_accepted") throw new Error("prompt not accepted: " + acc.type)
+  const text = []
+  const tools = []
+  const patches = []
+  const reason = []
+  let events = 0
+  let lastErr = null
+  let done = false
+  while (!done) {
+    const ev = await next(ws, () => true)
+    events++
+    if (ev.type !== "event") continue
+    const inner = ev.event
+    if (inner.type === "message.part.updated") {
+      const p = inner.properties?.part
+      if (!p || p.sessionID !== sessionId) continue
+      if (p.type === "text" && p.text) text.push(p.text)
+      else if (p.type === "tool" && p.state?.title) tools.push(p.tool + ": " + p.state.title)
+      else if (p.type === "reasoning" && p.text) reason.push("(" + p.text.length + " chars)")
+      else if (p.type === "patch" && p.files) for (const f of p.files) patches.push(f.path + " (+" + (f.additions||0) + "/-" + (f.deletions||0) + ")")
+    } else if (inner.type === "session.error") {
+      const e = inner.properties?.error
+      lastErr = (e?.name || "Error") + ": " + (e?.message || "unknown")
+    } else if (inner.type === "session.status" && inner.properties?.status?.type === "idle") {
+      done = true
+    }
+  }
+  clearTimeout(timer)
+  try { ws.close() } catch {}
+  await writeResult({
+    ok: true, sessionId, url, eventsReceived: events, textChunks: text.length,
+    text: text.join(""),
+    tools, patches, reasoning: reason, lastError: lastErr,
+    finishedAt: new Date().toISOString(),
+  })
+} catch (e) {
+  clearTimeout(timer)
+  await writeResult({ ok: false, error: String(e?.message || e), finishedAt: new Date().toISOString() })
+  process.exit(1)
+}
+`

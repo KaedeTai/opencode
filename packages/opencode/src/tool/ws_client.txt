@@ -10,6 +10,10 @@ When to use:
 - You want a second opinion from a different model on the
   same task. Same as above but pick a peer opencode that's
   configured with a different provider.
+- You want a long-running background task. Use `detached: true`
+  to fire-and-forget; the result lands in a file the agent
+  reads back later. Lets the main agent keep working while
+  the sub-agent grinds on a slow task.
 
 Not for:
 - Talking to the current opencode's own server. Use the
@@ -18,18 +22,37 @@ Not for:
   the opencode REST endpoints instead.
 
 Usage notes:
-- The peer must be reachable at the given `url` and have
-  `opencode websocket` (or the legacy `packages/websocket`
-  sidecar) running.
+- The peer must be reachable at the given `url` (or the
+  default `ws://127.0.0.1:9999/ws`). For the long-lived
+  pattern, start the bridge ONCE with
+  `bun run scripts/ws-spawn-keepalive.ts` (or set
+  `autoStart: true` for the tool to spawn it on demand) —
+  it stays up between calls so session history and tool
+  state persist.
+- If `url` is omitted, the tool reads `$WEBSOCKET_BRIDGE_URL`
+  and falls back to `ws://127.0.0.1:9999/ws`. The user
+  doesn't need to remember the URL.
+- If `sessionId` is omitted, the tool reuses the last-used
+  session from `~/.config/opencode/peer-session.json` (so
+  repeated calls share the peer's context) — or creates a
+  new one if there's no persisted state. The first call
+  picks a session; subsequent calls land in the same one
+  automatically. To opt out of persistence (one-off work),
+  pass an explicit `sessionId`.
 - The whole assistant turn is collected: text streams are
   concatenated; tool calls, reasoning, and patches are
   summarized inline. If you need the full event log, run
   the peer's WebSocket directly from your own client.
 - The peer decides which model to use (its own default).
-  To pick a model on the peer, set the peer's
-  `OPENCODE_DEFAULT_MODEL` env var or use its `/model`
-  command first.
+  To pick a model on the peer, edit the peer's
+  `~/.config/opencode/opencode.jsonc` `model` / `provider`
+  fields or use the peer's `/model` command.
 - Connection and prompt are subject to a `timeout` (default
-  60s, max 5 minutes). Long-running tasks should be
-  preflighted with a separate `webfetch` ping to the
-  peer's `/health` endpoint.
+  60s, max 5 minutes). Long-running tasks should use
+  `detached: true` instead of bumping the timeout.
+- `detached: true` returns a `task_id` and a `resultFile`
+  path immediately. The worker writes
+  `{ ok, sessionId, text, tools, patches, reasoning, lastError }`
+  to that file when the peer goes idle. Poll with the
+  `read` tool. The default timeout for detached work is
+  5 minutes; longer tasks need a manual `bun` script.

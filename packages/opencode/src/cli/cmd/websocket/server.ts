@@ -164,13 +164,29 @@ async function handleMessage(
       return
 
     case "switch_session":
-      if (!state.sessions.has(msg.sessionId)) {
+      if (state.sessions.has(msg.sessionId)) {
+        setActive(state, msg.sessionId)
+        sendTo(ws, { type: "session_switched", sessionId: msg.sessionId })
+        return
+      }
+      // Fallback: client may be reconnecting to a session
+      // created on a previous connection. The session lives
+      // on the opencode server; ask it, then adopt.
+      try {
+        const res = await client.session.get({ path: { id: msg.sessionId } })
+        const data = (res as { data?: { id?: string; title?: string } }).data
+        if (!data?.id) throw new Error("not found")
+        addSession(
+          state,
+          { id: data.id, title: data.title ?? "(imported)", inflight: false },
+          true,
+        )
+        sendTo(ws, { type: "session_switched", sessionId: data.id })
+        return
+      } catch {
         sendTo(ws, { type: "error", code: "session_not_found", message: msg.sessionId })
         return
       }
-      setActive(state, msg.sessionId)
-      sendTo(ws, { type: "session_switched", sessionId: msg.sessionId })
-      return
 
     case "close_session": {
       if (!state.sessions.has(msg.sessionId)) {
