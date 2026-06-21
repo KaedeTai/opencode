@@ -30,5 +30,9 @@ export function isOverflow(input: {
 
   const count =
     input.tokens.total || input.tokens.input + input.tokens.output + input.tokens.cache.read + input.tokens.cache.write
+  // [OVERFLOW_DEBUG] log actual numbers so we can verify overflow detection
+  console.log(
+    `[OVERFLOW_DEBUG] total=${input.tokens.total} input=${input.tokens.input} output=${input.tokens.output} cache.read=${input.tokens.cache.read} cache.write=${input.tokens.cache.write} count=${count} usable=${usable(input)} overflow=${count >= usable(input)}`,
+  )
   return count >= usable(input)
 }
