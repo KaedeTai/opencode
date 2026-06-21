@@ -28,11 +28,14 @@ export function isOverflow(input: {
   if (input.cfg.compaction?.auto === false) return false
   if (input.model.limit.context === 0) return false
 
-  const count =
-    input.tokens.total || input.tokens.input + input.tokens.output + input.tokens.cache.read + input.tokens.cache.write
+  const fallback =
+    input.tokens.input + input.tokens.output + input.tokens.cache.read + input.tokens.cache.write
+  const count = input.tokens.total || fallback
   // [OVERFLOW_DEBUG] log actual numbers so we can verify overflow detection
+  // diagnostic: provider 'total' may exclude cache.read (cache is prefilled, not context cost)
+  // fallback = input+output+cache.read+cache.write = full session size estimate
   console.log(
-    `[OVERFLOW_DEBUG] total=${input.tokens.total} input=${input.tokens.input} output=${input.tokens.output} cache.read=${input.tokens.cache.read} cache.write=${input.tokens.cache.write} count=${count} usable=${usable(input)} overflow=${count >= usable(input)}`,
+    `[OVERFLOW_DEBUG] providerTotal=${input.tokens.total} input=${input.tokens.input} output=${input.tokens.output} cache.read=${input.tokens.cache.read} cache.write=${input.tokens.cache.write} fallbackSum=${fallback} usable=${usable(input)} usingCount=${count} overflow=${count >= usable(input)} totalIncludesCache=${input.tokens.total >= input.tokens.input + input.tokens.cache.read}`,
   )
   return count >= usable(input)
 }
