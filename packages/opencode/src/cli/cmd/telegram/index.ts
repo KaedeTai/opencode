@@ -1818,11 +1818,29 @@ export const TelegramCommand = effectCmd({
     ]).then(() => log.debug("setMyCommands done")).catch((e) => log.error("setMyCommands", { message: eMsg(e) }))
 
     // ── Launch ─────────────────────────────────────────────────────
-    bot.launch().then(() => {
-      log.debug("bot.launch() unexpectedly resolved")
-    }).catch((err) => {
-      log.error("bot.launch()", { message: eMsg(err) })
-    })
+    // 409 Conflict: another getUpdates request is active (a previous bot
+    // instance still holds the long-poll). Telegram expires that session
+    // within ~5-10min after a clean stop, but SIGKILL of the old process
+    // can leave the server-side session alive longer. Retry with backoff
+    // instead of staying broken until a manual restart.
+    const launchWithRetry = async () => {
+      let attempt = 0
+      while (true) {
+        try {
+          await bot.launch()
+          log.debug("bot.launch() unexpectedly resolved")
+          return
+        } catch (err) {
+          attempt++
+          const msg = eMsg(err)
+          const is409 = /409/.test(msg)
+          const delay = is409 ? Math.min(10_000, 2_000 * attempt) : 5_000
+          log.error("bot.launch()", { attempt, message: msg, retryIn: delay })
+          await new Promise((r) => setTimeout(r, delay))
+        }
+      }
+    }
+    void launchWithRetry()
 
     // Clean up typing timers on shutdown so node doesn't keep the
     // event loop alive with stray intervals if bot.stop() races.

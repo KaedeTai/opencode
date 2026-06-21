@@ -275,6 +275,61 @@ const live: Layer.Layer<
       })
       // Default runtime path: AI SDK owns provider execution and tool dispatch;
       // LLMAISDK.toLLMEvents below normalizes fullStream parts for the processor.
+      // DEBUG-2026-06-21: print the prompt we're about to send. The token
+      // estimate here is chars/4 (rough heuristic for English/code — real
+      // BPE varies by ~2x but the order of magnitude is what we need to
+      // figure out why the server's overflow detector keeps reading 0).
+      const _msgs = prepared.messages
+      const _msgStats = _msgs.map((m: { role?: string; content?: unknown }) => {
+        const c = m.content
+        const text = typeof c === "string"
+          ? c
+          : Array.isArray(c)
+            ? c.map((p: { type?: string; text?: string }) => p?.text ?? "").join("")
+            : ""
+        return { role: m.role, chars: text.length, estTokens: Math.ceil(text.length / 4) }
+      })
+      const _totalChars = _msgStats.reduce((s: number, m) => s + m.chars, 0)
+      const _totalEst = _msgStats.reduce((s: number, m) => s + m.estTokens, 0)
+      // DEBUG-2026-06-21: write the actual request payload (messages,
+      // tools, params) to a file so we can verify the wire-level request
+      // sent to the provider. File path is shared with the response dump
+      // via setStreamDumpPath — the response dump overwrites this with
+      // the full request+response capture.
+      const _dumpPath = `/tmp/opencode-llm-dump/${Date.now()}-${input.sessionID}-step${(input as { step?: number }).step ?? "x"}.json`
+      try {
+        require("fs").mkdirSync("/tmp/opencode-llm-dump", { recursive: true })
+        require("fs").writeFileSync(
+          _dumpPath,
+          JSON.stringify(
+            {
+              phase: "request",
+              ts: new Date().toISOString(),
+              sessionID: input.sessionID,
+              providerID: input.model.providerID,
+              modelID: input.model.id,
+              contextLimit: input.model.limit.context,
+              messageCount: _msgs.length,
+              totalChars: _totalChars,
+              totalEstTokens: _totalEst,
+              perMessage: _msgStats,
+              messages: _msgs,
+            },
+            null,
+            2,
+          ),
+        )
+      } catch (e) {
+        console.log(`[LLM_DEBUG] request_dump_failed error=${e instanceof Error ? e.message : String(e)}`)
+      }
+      console.log(
+        `[LLM_DEBUG] sending messages=${_msgs.length} ` +
+        `totalChars=${_totalChars} estTokens~${_totalEst} ` +
+        `model=${input.model.providerID}/${input.model.id} ` +
+        `contextLimit=${input.model.limit.context} ` +
+        `perMessage=[${_msgStats.map((m) => `${m.role}:${m.chars}c/${m.estTokens}t`).join(", ")}] ` +
+        `dumpPath=${_dumpPath}`,
+      )
       return {
         type: "ai-sdk" as const,
         result: streamText({

@@ -13,6 +13,84 @@ type AISDKEvent = Result["fullStream"] extends AsyncIterable<infer T> ? T : neve
 type DebugState = { t0: number; firstDeltaLogged: boolean; firstReasoningDeltaLogged: boolean; stepT0: number; stepIndex: number }
 const streamDebug = new WeakMap<object, DebugState>()
 
+// DEBUG-2026-06-21 LATE: wire-level fetch interceptor for minimax.
+// Dumps REQUEST body (what opencode sends) and tee RESPONSE body so AI SDK
+// still gets the streaming ReadableStream (we don't .text() it -- that
+// would block and break SSE). The tee reader writes raw SSE bytes to file
+// in the background while the rest of the pipeline consumes normally.
+// Uses Object.defineProperty (writable configurable) because some runtimes
+// freeze globalThis.fetch and a plain assignment throws "readonly property".
+const _origFetch = globalThis.fetch
+if (!(globalThis as any).__minimaxWireHooked) {
+  ;(globalThis as any).__minimaxWireHooked = true
+  const hookedFetch = async function hookedFetch(input: any, init?: any): Promise<Response> {
+    const url = typeof input === "string" ? input : input?.url ?? ""
+    const isMinimax = url.includes("minimaxi.com") || url.includes("minimax")
+    if (!isMinimax) return _origFetch.call(globalThis as any, input, init)
+    const dumpDir = "/tmp/opencode-wire-dump"
+    const tag = `${Date.now()}-${process.pid}-${Math.random().toString(36).slice(2, 8)}`
+    const reqPath = `${dumpDir}/${tag}-req.txt`
+    const resPath = `${dumpDir}/${tag}-res.txt`
+    try {
+      const { mkdirSync, writeFileSync } = await import("fs")
+      mkdirSync(dumpDir, { recursive: true })
+      const reqBody = init?.body
+      let reqStr = `[REQ ${new Date().toISOString()}] ${init?.method ?? "GET"} ${url}\n`
+      const hdrs = init?.headers
+      if (hdrs) reqStr += `headers: ${JSON.stringify(hdrs, null, 2)}\n`
+      if (typeof reqBody === "string") reqStr += `body: ${reqBody}\n`
+      else if (reqBody) reqStr += `body: <non-string, type=${typeof reqBody}>\n`
+      writeFileSync(reqPath, reqStr)
+    } catch {}
+    const resp = await _origFetch.call(globalThis as any, input, init)
+    try {
+      const { mkdirSync, createWriteStream } = await import("fs")
+      mkdirSync(dumpDir, { recursive: true })
+      const ws = createWriteStream(resPath)
+      ws.write(`[RES ${new Date().toISOString()}] status=${resp.status} ok=${resp.ok} content-type=${resp.headers.get("content-type")}\n`)
+      if (!resp.body) {
+        ws.end("[no body]")
+        return resp
+      }
+      // Tee the body: one reader writes to file, the other goes back to caller.
+      const [a, b] = (resp.body as ReadableStream<Uint8Array>).tee()
+      ;(async () => {
+        const reader = a.getReader()
+        const dec = new TextDecoder()
+        try {
+          while (true) {
+            const { done, value } = await reader.read()
+            if (done) break
+            ws.write(dec.decode(value, { stream: true }))
+          }
+          ws.write(dec.decode())
+          ws.end()
+        } catch (e) {
+          ws.write(`\n[tee reader error] ${String(e)}\n`)
+          ws.end()
+        }
+      })()
+      return new Response(b, { status: resp.status, statusText: resp.statusText, headers: resp.headers })
+    } catch (e) {
+      try {
+        const { writeFileSync } = await import("fs")
+        writeFileSync(resPath, `[RES hook error] ${String(e)}`)
+      } catch {}
+      return resp
+    }
+  }
+  try {
+    Object.defineProperty(globalThis, "fetch", {
+      value: hookedFetch,
+      writable: true,
+      configurable: true,
+      enumerable: true,
+    })
+  } catch (e) {
+    console.error("[LLM_DEBUG] failed to install fetch hook:", String(e))
+  }
+}
+
 export function adapterState() {
   return {
     step: 0,
@@ -22,7 +100,18 @@ export function adapterState() {
     currentReasoningID: undefined as string | undefined,
     toolNames: {} as Record<string, string>,
     copilotTotalNanoAiu: undefined as number | undefined,
+    // DEBUG-2026-06-21: raw chunks captured from AI SDK for the final
+    // wire-level dump. See case "finish" for the write.
+    rawChunks: [] as unknown[],
   }
+}
+
+// DEBUG-2026-06-21: per-stream dump path set by the caller (llm.ts)
+// before streamText runs. WeakMap keeps it scoped to the state object
+// without leaking across streams.
+const _streamDump = new WeakMap<object, string>()
+export function setStreamDumpPath(state: object, path: string) {
+  _streamDump.set(state, path)
 }
 
 function finishReason(value: string | undefined): FinishReason {
@@ -49,6 +138,11 @@ function copilotTotalNanoAiu(value: unknown) {
 }
 
 function usage(value: unknown) {
+  // DEBUG-2026-06-21: print raw usage object so we can see exactly what the
+  // provider put in the response. Many providers (incl. some openai-compat
+  // ones) don't populate the standard AI SDK keys and we silently drop the
+  // token counts to 0 — leading to "context overflow never detected".
+  console.log(`[LLM_DEBUG] raw_usage=${JSON.stringify(value)}`)
   if (!value || typeof value !== "object") return undefined
   const item = value as {
     inputTokens?: number
@@ -128,6 +222,39 @@ export function toLLMEvents(
 
     case "finish":
       return Effect.sync(() => {
+        // DEBUG-2026-06-21: write the captured raw chunks + the parsed
+        // final usage to the dump file so we can see exactly what the
+        // provider put on the wire. Some providers (minimax included)
+        // return token counts of 0 in event.totalUsage but the raw
+        // stream chunks often contain the real counts — the dump lets
+        // us reconcile.
+        const dumpPath = _streamDump.get(state)
+          if (dumpPath) {
+            try {
+              const fs = require("fs")
+              const responsePayload = {
+                phase: "response",
+                ts: new Date().toISOString(),
+                rawChunkCount: state.rawChunks.length,
+                rawChunks: state.rawChunks,
+                finalUsage: event.totalUsage,
+                finalFinishReason: event.finishReason,
+                finalProviderMetadata: "providerMetadata" in event ? event.providerMetadata : undefined,
+              }
+              // Merge into existing request-phase dump so we keep the
+              // sent messages and overwrite a single file per stream.
+              let merged: any = responsePayload
+              try {
+                const existing = JSON.parse(fs.readFileSync(dumpPath, "utf8"))
+                merged = { ...existing, ...responsePayload }
+              } catch {
+                /* request phase never wrote — keep response only */
+              }
+              fs.writeFileSync(dumpPath, JSON.stringify(merged, null, 2))
+          } catch (e) {
+            console.log(`[LLM_DEBUG] dump_failed error=${e instanceof Error ? e.message : String(e)}`)
+          }
+        }
         const events = [
           LLMEvent.finish({
             reason: finishReason(event.finishReason),
@@ -135,10 +262,7 @@ export function toLLMEvents(
             providerMetadata: "providerMetadata" in event ? providerMetadata(event.providerMetadata) : undefined,
           }),
         ]
-        // Reset so the adapter can be reused for a follow-up stream without leaking
-        // counters or block IDs. adapterState() is the single source of truth for shape.
-        Object.assign(state, adapterState())
-        return events
+        return Object.assign(state, adapterState()), events
       })
 
     case "text-start":
@@ -300,6 +424,12 @@ export function toLLMEvents(
     case "raw":
       return Effect.sync(() => {
         state.copilotTotalNanoAiu = copilotTotalNanoAiu(event.rawValue) ?? state.copilotTotalNanoAiu
+        // DEBUG-2026-06-21: accumulate every raw chunk the provider sent.
+        // The AI SDK fullStream exposes a "raw" event for every wire-level
+        // chunk when the model was created with `includeRawChunks: true`
+        // (already enabled in llm.ts). The final dump in case "finish"
+        // gives us the complete wire payload for diagnosis.
+        state.rawChunks.push(event.rawValue)
         return []
       })
 
