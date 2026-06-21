@@ -134,7 +134,7 @@ export const TelegramCommand = effectCmd({
         const res = await client.session.create({ body: { title: `Telegram ${cid}` } })
         if (res.error) return null
         const sessionId = res.data.id
-        addSession(cid, { sessionId, lastSent: null, lastReasoning: null, userPrompt: null, streamMsgId: null, lastStreamEdit: null, inflight: false, inflightWait: null, inflightWaitTimer: null })
+        addSession(cid, { sessionId, lastSent: null, lastReasoning: null, userPrompt: null, streamMsgId: null, lastStreamEdit: null, inflight: false, inflightWait: null, inflightWaitTimer: null, lastRetryAttempt: null })
         return sessionId
       } catch (e) {
         log.error("createSession", { message: eMsg(e) })
@@ -320,6 +320,27 @@ export const TelegramCommand = effectCmd({
       let session = options.targetSessionId
         ? getSession(cid, options.targetSessionId)
         : getActiveSession(cid)
+      // DEBUG-2026-06-21: log which session we resolved + server-side token count
+      // before dispatching, to detect when bot picks a dead/oversized session
+      log.info("dispatchPrompt.resolve", {
+        cid,
+        targetSessionId: options.targetSessionId ?? null,
+        resolvedSessionId: session?.sessionId ?? null,
+      })
+      if (session) {
+        // server-side session.get() to read tokens (mirrors /status output)
+        client.session
+          .get({ path: { id: session.sessionId } })
+          .then((res) => {
+            const data = res.data as { tokens?: { input?: number; cache?: { read?: number } } } | undefined
+            log.info("dispatchPrompt.serverTokens", {
+              sessionId: session!.sessionId,
+              inputTokens: data?.tokens?.input ?? null,
+              cacheReadTokens: data?.tokens?.cache?.read ?? null,
+            })
+          })
+          .catch((e) => log.warn("dispatchPrompt.serverTokensFailed", { error: eMsg(e) }))
+      }
       if (!session) {
         const sid = await createSession(cid)
         if (!sid) return { error: "Failed to create session." as const }
@@ -372,7 +393,36 @@ export const TelegramCommand = effectCmd({
       })
       if (result.error) {
         session.inflight = false
-        return { error: result.error.data?.message ?? "Failed" as const }
+        // DEBUG-2026-06-21: server prune deleted this session while disk still
+        // referenced it. Auto-recover: create a fresh session, swap active,
+        // surface a hint to the user, then return ok so the new prompt continues.
+        const errMsg = result.error.data?.message ?? ""
+        if (errMsg.toLowerCase().includes("session not found") || errMsg.toLowerCase().includes("not found")) {
+          log.warn("dispatchPrompt.sessionMissing", {
+            oldSessionId: session.sessionId,
+            errMsg,
+          })
+          // Promote next-most-recent surviving session, or create fresh.
+          const replacement = pickFallbackSession(cid, session.sessionId)
+          if (replacement) {
+            setActiveSession(cid, replacement)
+            await reply(
+              cid,
+              `♻️ Old session was cleaned up server-side. Switched to ${replacement.slice(0, 8)}… — re-send your prompt.`,
+            )
+            // Don't return ok — user must re-send because we lost their text
+            return { error: "Session missing — switched to fallback" as const }
+          }
+          const fresh = await createSession(cid)
+          if (fresh) {
+            await reply(
+              cid,
+              `♻️ Old session was cleaned up server-side. Started a fresh session — re-send your prompt.`,
+            )
+            return { error: "Session missing — fresh session created" as const }
+          }
+        }
+        return { error: errMsg || "Failed" as const }
       }
       // Don't clear inflight here — the event stream clears it on
       // the matching `session.status` idle event. That way concurrent
@@ -430,6 +480,10 @@ export const TelegramCommand = effectCmd({
       lastSent: string | null
       lastReasoning: string | null
       userPrompt: string | null
+      // Last retry attempt we already notified the user about, so a
+      // burst of status.type=retry events for the same attempt only
+      // sends one Telegram message.
+      lastRetryAttempt: number | null
       // Telegram message id of the currently-streaming assistant text
       // message. Non-null between the first text chunk and the next
       // boundary (reasoning / tool / patch / idle). Lets us edit the
@@ -476,10 +530,25 @@ export const TelegramCommand = effectCmd({
     // (slow as the bot runs longer).
     const sessionToChat = new Map<string, string>()
 
-    // Track pending questions so callback buttons can resolve label from index
-    const pendingQuestions = new Map<string, { sessionID: string; options: Array<{ label: string; description: string }> }>()
+    // Track pending questions so callback buttons can resolve label from index.
+    // One q.id can have N questions (server schema: payload.answers is string[][],
+    // one slot per question). We store ALL options arrays here keyed by qid so
+    // the button callback can resolve any question's option index, and accumulate
+    // answers in pendingAnswers (one slot per question) until all are answered
+    // before posting to the server.
+    const pendingQuestions = new Map<
+      string,
+      {
+        sessionID: string
+        questions: Array<{ options: Array<{ label: string; description: string }> }>
+      }
+    >()
+    // Accumulated answers per qid: pendingAnswers.get(qid)[questionIndex] = string[]
+    const pendingAnswers = new Map<string, string[][]>()
     // Track which question each chat is currently waiting for a custom answer on
-    const pendingCustomQuestion = new Map<string, string>()
+    // (qid + questionIndex, since the same chat could be mid-custom on one of
+    // several questions).
+    const pendingCustomQuestion = new Map<string, { questionID: string; questionIndex: number }>()
 
     // ── Chat / session helpers ────────────────────────────────────
     // Get the active SessionState for a chat (null if none).
@@ -541,6 +610,23 @@ export const TelegramCommand = effectCmd({
         chats.delete(cid)
       }
       persistChats()
+    }
+
+    // DEBUG-2026-06-21: pick the next-most-recent session for `cid` that
+    // is NOT `excludeId`. Used by dispatchPrompt to fall back when the
+    // resolved session has been pruned server-side. Async because we have
+    // to validate each candidate against the server (some archived entries
+    // may also be gone).
+    async function pickFallbackSession(cid: string, excludeId: string): Promise<string | null> {
+      const chat = chats.get(cid)
+      if (!chat) return null
+      for (const sid of chat.order) {
+        if (sid === excludeId) continue
+        const res = await client.session.get({ path: { id: sid } }).catch(() => null)
+        const data = res as { error?: unknown; data?: unknown } | null
+        if (data?.data) return sid
+      }
+      return null
     }
 
     // Find the chat that owns a session id. Uses the reverse index
@@ -725,12 +811,33 @@ export const TelegramCommand = effectCmd({
       if (!text) return
 
       // ── Custom answer to a pending question ──────────────────────
-      const pendingQID = pendingCustomQuestion.get(cid)
-      if (pendingQID && !text.startsWith("/")) {
-        const pending = pendingQuestions.get(pendingQID)
+      // pendingCustomQuestion is { questionID, questionIndex } (not just qid)
+      // so we know which slot to fill in the multi-question batch.
+      const pendingCustom = pendingCustomQuestion.get(cid)
+      if (pendingCustom && !text.startsWith("/")) {
+        const { questionID, questionIndex } = pendingCustom
+        const pending = pendingQuestions.get(questionID)
         if (pending) {
-          await answerQuestion(cid, pendingQID, [[text]], pending.sessionID)
-          pendingQuestions.delete(pendingQID)
+          const slot = pendingAnswers.get(questionID)
+          if (!slot) {
+            // State desync — pendingQuestions exists but no slot. Reset both.
+            pendingCustomQuestion.delete(cid)
+            pendingQuestions.delete(questionID)
+            await reply(cid, "❌ Question state lost, please resend your prompt.")
+            return
+          }
+          slot[questionIndex] = [text]
+          pendingCustomQuestion.delete(cid)
+          const allAnswered = pending.questions.every((_, i) => slot[i] && slot[i].length > 0)
+          if (!allAnswered) {
+            const total = pending.questions.length
+            await reply(cid, `✅ Saved custom answer for question ${questionIndex + 1}/${total}. Answer the remaining questions to submit.`)
+            return
+          }
+          // All answered — post and clean up.
+          await answerQuestion(cid, questionID, slot, pending.sessionID)
+          pendingQuestions.delete(questionID)
+          pendingAnswers.delete(questionID)
         } else {
           pendingCustomQuestion.delete(cid)
         }
@@ -1036,7 +1143,7 @@ export const TelegramCommand = effectCmd({
             // Switch active session to the fork. addSession handles
             // moving the old active to the back of the chat's order
             // and re-pointing the active id.
-            addSession(cid, { sessionId: newId, lastSent: null, lastReasoning: null, userPrompt: null, streamMsgId: null, lastStreamEdit: null, inflight: false, inflightWait: null, inflightWaitTimer: null })
+            addSession(cid, { sessionId: newId, lastSent: null, lastReasoning: null, userPrompt: null, streamMsgId: null, lastStreamEdit: null, inflight: false, inflightWait: null, inflightWaitTimer: null, lastRetryAttempt: null })
             await reply(cid, `🍴 Forked!\nOld: \`${s.sessionId.slice(0, 8)}…\`\nNew: \`${newId.slice(0, 8)}…\``)
           }, "fork handler")
           return
@@ -1230,14 +1337,19 @@ export const TelegramCommand = effectCmd({
       // ── Question answer ───────────────────────────────────────────
       if (data.startsWith("ques:")) {
         const parts = data.split(":")
-        // Format: ques:<questionID>:<optionIndex | "custom">
-        if (parts.length !== 3) return
+        // Format: ques:<questionID>:<questionIndex>:<optionIndex | "custom">
+        if (parts.length !== 4) return
         const questionID = parts[1]
-        const answer = parts[2]
+        const questionIndex = parseInt(parts[2], 10)
+        const answer = parts[3]
         if (answer === "custom") {
-          // Set pending state — next text message will be the answer
-          pendingCustomQuestion.set(cid, questionID)
-          await reply(cid, "✏️ Please type your answer:")
+          // Set pending state — next text message will be the answer.
+          // Stored as {questionID, questionIndex} so a chat that's mid-custom
+          // on Q1 can still answer Q2 by tapping another button.
+          pendingCustomQuestion.set(cid, { questionID, questionIndex })
+          const total = pendingQuestions.get(questionID)?.questions.length ?? 1
+          const num = total > 1 ? ` (${questionIndex + 1}/${total})` : ""
+          await reply(cid, `✏️ Please type your answer for question${num}:`)
           return
         }
         // Option button — look up the label from stored question
@@ -1246,14 +1358,37 @@ export const TelegramCommand = effectCmd({
           await reply(cid, "❌ Question expired, please resend your prompt.")
           return
         }
+        if (isNaN(questionIndex) || questionIndex < 0 || questionIndex >= pending.questions.length) {
+          await reply(cid, "❌ Invalid question index.")
+          return
+        }
+        const options = pending.questions[questionIndex].options
         const optionIndex = parseInt(answer, 10)
-        if (isNaN(optionIndex) || optionIndex < 0 || optionIndex >= pending.options.length) {
+        if (isNaN(optionIndex) || optionIndex < 0 || optionIndex >= options.length) {
           await reply(cid, "❌ Invalid option.")
           return
         }
-        const label = pending.options[optionIndex].label
-        await answerQuestion(cid, questionID, [[label]], pending.sessionID)
+        const label = options[optionIndex].label
+        // Accumulate. The server expects payload.answers to be one slot per
+        // question (string[][]), so we must wait until every question in the
+        // batch is answered before posting — otherwise an early post for
+        // "just Q1" leaves Q2 unanswered and the server expires the request.
+        const slot = pendingAnswers.get(questionID)
+        if (!slot) {
+          await reply(cid, "❌ Question state lost, please resend your prompt.")
+          return
+        }
+        slot[questionIndex] = [label]
+        const allAnswered = pending.questions.every((_, i) => slot[i] && slot[i].length > 0)
+        if (!allAnswered) {
+          const total = pending.questions.length
+          await reply(cid, `✅ Saved answer for question ${questionIndex + 1}/${total}. Answer the remaining questions to submit.`)
+          return
+        }
+        // All questions answered — post the full batch and clean up.
+        await answerQuestion(cid, questionID, slot, pending.sessionID)
         pendingQuestions.delete(questionID)
+        pendingAnswers.delete(questionID)
         return
       }
 
@@ -1298,7 +1433,7 @@ export const TelegramCommand = effectCmd({
               return
             }
             title = verData.data.title ?? "(untitled)"
-            state = { sessionId: newId, lastSent: null, lastReasoning: null, userPrompt: null, streamMsgId: null, lastStreamEdit: null, inflight: false, inflightWait: null, inflightWaitTimer: null }
+            state = { sessionId: newId, lastSent: null, lastReasoning: null, userPrompt: null, streamMsgId: null, lastStreamEdit: null, inflight: false, inflightWait: null, inflightWaitTimer: null, lastRetryAttempt: null }
             // makeActive=true so addSession switches the active id.
             addSession(cid, state)
           } else {
@@ -1393,6 +1528,21 @@ export const TelegramCommand = effectCmd({
                       s.streamMsgId = null
                       s.lastStreamEdit = null
                       s.inflight = false
+                      // Reset the retry-notify dedup counter so the next
+                      // prompt's first attempt is reported again.
+                      s.lastRetryAttempt = null
+                      // Clear any pending question state for this session —
+                      // the server is done with the current turn, so any
+                      // unanswered questions are moot. Prevents the bot
+                      // from holding a stale pendingQuestions entry that
+                      // a later (different) question.asked could collide
+                      // with if it shared the qid by accident.
+                      for (const [qid, p] of pendingQuestions) {
+                        if (p.sessionID === props.sessionID) {
+                          pendingQuestions.delete(qid)
+                          pendingAnswers.delete(qid)
+                        }
+                      }
                       // Wake any dispatchPrompt waiting for idle. The
                       // safety timer is cleared because the real idle
                       // event arrived in time.
@@ -1404,8 +1554,31 @@ export const TelegramCommand = effectCmd({
                       }
                       clearPendingStreamEdit(cid)
                       stopTyping(cid)
+                    } else if (props.status?.type === "retry") {
+                      // Provider error → server is backing off and will retry.
+                      // Without this the bot stays silent (just "typing") and the
+                      // user can't tell anything went wrong. Notify once per
+                      // attempt, deduped by attempt number so short backoffs
+                      // (2s/4s/8s) don't spam the chat.
+                      const r = props.status as {
+                        type: "retry"
+                        attempt: number
+                        message: string
+                        next: number
+                        action?: { title: string; message: string; label: string; link?: string }
+                      }
+                      if (s.lastRetryAttempt !== r.attempt) {
+                        s.lastRetryAttempt = r.attempt
+                        const waitSec = Math.max(0, Math.ceil((r.next - Date.now()) / 1000))
+                        const link = r.action?.link ? `\n${r.action.title}: ${r.action.link}` : ""
+                        await reply(
+                          cid,
+                          `⏳ Provider error, retrying in ~${waitSec}s (attempt ${r.attempt}): ${trunc(r.message, 250)}${link}`,
+                        )
+                      }
+                      startTyping(cid)
                     } else {
-                      // busy / retry — show "typing" indicator
+                      // busy — show "typing" indicator
                       startTyping(cid)
                     }
                   }
@@ -1436,6 +1609,7 @@ export const TelegramCommand = effectCmd({
                   s.streamMsgId = null
                   s.lastStreamEdit = null
                   s.inflight = false
+                  s.lastRetryAttempt = null
                   clearPendingStreamEdit(cid)
                   if (s.inflightWaitTimer) clearTimeout(s.inflightWaitTimer)
                   if (s.inflightWait) {
@@ -1502,22 +1676,41 @@ export const TelegramCommand = effectCmd({
                   log.debug("question session not found")
                   continue
                 }
-                for (const question of q.questions) {
-                  // Store for label lookup on button press
-                  pendingQuestions.set(q.id, { sessionID: q.sessionID, options: question.options })
+                // Store all questions' options under a single qid, and seed
+                // pendingAnswers with empty slots (one per question). The
+                // callback handler fills in slots and posts when all are
+                // answered. See 2026-06-21-multi-question-bug.md for the
+                // previous bug where looping over q.questions and calling
+                // pendingQuestions.set(q.id, …) inside the loop overwrote
+                // earlier questions — the first answer would delete the
+                // whole entry, leaving the next question's button click
+                // resolving to "Question expired".
+                pendingQuestions.set(q.id, {
+                  sessionID: q.sessionID,
+                  questions: q.questions.map((qq) => ({ options: qq.options })),
+                })
+                pendingAnswers.set(
+                  q.id,
+                  q.questions.map(() => [] as string[]),
+                )
+                for (let qi = 0; qi < q.questions.length; qi++) {
+                  const question = q.questions[qi]
                   const head = question.header ? `[${question.header}]\n` : ""
-                  const text = `❓ ${head}${question.question}`
+                  // Number the question when there are >1 so users can
+                  // tell which one Telegram is asking about.
+                  const qNum = q.questions.length > 1 ? ` (${qi + 1}/${q.questions.length})` : ""
+                  const text = `❓ ${head}${question.question}${qNum}`
                   // Build one button row per option
                   const rows = question.options.map((opt, i) => [
-                    Markup.button.callback(opt.label, `ques:${q.id}:${i}`),
+                    Markup.button.callback(opt.label, `ques:${q.id}:${qi}:${i}`),
                   ])
                   // Add a custom answer button if there are no options or tool allows it
                   if (question.options.length === 0) {
-                    rows.push([Markup.button.callback("✏️ Custom answer", `ques:${q.id}:custom`)])
+                    rows.push([Markup.button.callback("✏️ Custom answer", `ques:${q.id}:${qi}:custom`)])
                   }
                   const btns = Markup.inlineKeyboard(rows)
                   await reply(cid, text, btns)
-                  log.debug("question buttons sent", { header: question.header })
+                  log.debug("question buttons sent", { header: question.header, questionIndex: qi })
                 }
                 continue
               }
