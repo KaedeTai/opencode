@@ -30,9 +30,18 @@ import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { ModelStatus } from "./model-status"
 import { RuntimeFlags } from "@/effect/runtime-flags"
+import { fetch as undiciFetch } from "undici"
 import { ProviderError } from "./error"
 
 const OPENAI_HEADER_TIMEOUT_DEFAULT = 10_000
+
+// POISON-2026-06-22: Bun's native fetch delivers ReadableStream chunks that
+// break the AI SDK's Anthropic SSE parser — the parser only sees 1-2 chars
+// ({c, {M, etc.) instead of complete SSE events. undici's fetch produces
+// standard-compliant ReadableStream that the SSE parser can consume correctly.
+// This is the same root cause as the tee() bug — Bun's ReadableStream semantics
+// differ from what the AI SDK Anthropic protocol parser expects.
+const defaultFetch = undiciFetch
 
 function wrapSSE(res: Response, ms: number, ctl: AbortController) {
   if (typeof ms !== "number" || ms <= 0) return res
@@ -1690,7 +1699,7 @@ export const layer = Layer.effect(
         delete options["headerTimeout"]
 
         options["fetch"] = async (input: any, init?: BunFetchRequestInit) => {
-          const fetchFn = customFetch ?? fetch
+          const fetchFn = customFetch ?? defaultFetch
           const opts = init ?? {}
           const chunkAbortCtl = typeof chunkTimeout === "number" && chunkTimeout > 0 ? new AbortController() : undefined
           const headerTimeoutMs = headerTimeout === false ? undefined : headerTimeout

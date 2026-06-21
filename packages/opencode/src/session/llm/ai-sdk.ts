@@ -48,36 +48,14 @@ if (!(globalThis as any).__minimaxWireHooked) {
       mkdirSync(dumpDir, { recursive: true })
       const ws = createWriteStream(resPath)
       ws.write(`[RES ${new Date().toISOString()}] status=${resp.status} ok=${resp.ok} content-type=${resp.headers.get("content-type")}\n`)
-      if (!resp.body) {
-        ws.end("[no body]")
-        return resp
-      }
-      // Tee the body: one reader writes to file, the other goes back to caller.
-      const [a, b] = (resp.body as ReadableStream<Uint8Array>).tee()
-      ;(async () => {
-        const reader = a.getReader()
-        const dec = new TextDecoder()
-        try {
-          while (true) {
-            const { done, value } = await reader.read()
-            if (done) break
-            ws.write(dec.decode(value, { stream: true }))
-          }
-          ws.write(dec.decode())
-          ws.end()
-        } catch (e) {
-          ws.write(`\n[tee reader error] ${String(e)}\n`)
-          ws.end()
-        }
-      })()
-      return new Response(b, { status: resp.status, statusText: resp.statusText, headers: resp.headers })
+      ws.end(" [body logging disabled — Bun clone/tee corrupts ReadableStream for AI SDK SSE parser]\n")
     } catch (e) {
       try {
         const { writeFileSync } = await import("fs")
         writeFileSync(resPath, `[RES hook error] ${String(e)}`)
       } catch {}
-      return resp
     }
+    return resp
   }
   try {
     Object.defineProperty(globalThis, "fetch", {
@@ -228,32 +206,35 @@ export function toLLMEvents(
         // return token counts of 0 in event.totalUsage but the raw
         // stream chunks often contain the real counts — the dump lets
         // us reconcile.
-        const dumpPath = _streamDump.get(state)
-          if (dumpPath) {
-            try {
-              const fs = require("fs")
-              const responsePayload = {
-                phase: "response",
-                ts: new Date().toISOString(),
-                rawChunkCount: state.rawChunks.length,
-                rawChunks: state.rawChunks,
-                finalUsage: event.totalUsage,
-                finalFinishReason: event.finishReason,
-                finalProviderMetadata: "providerMetadata" in event ? event.providerMetadata : undefined,
-              }
-              // Merge into existing request-phase dump so we keep the
-              // sent messages and overwrite a single file per stream.
-              let merged: any = responsePayload
-              try {
-                const existing = JSON.parse(fs.readFileSync(dumpPath, "utf8"))
-                merged = { ...existing, ...responsePayload }
-              } catch {
-                /* request phase never wrote — keep response only */
-              }
-              fs.writeFileSync(dumpPath, JSON.stringify(merged, null, 2))
-          } catch (e) {
-            console.log(`[LLM_DEBUG] dump_failed error=${e instanceof Error ? e.message : String(e)}`)
+        // FIX-2026-06-22: previously this only wrote when setStreamDumpPath
+        // had been called — but nobody calls setStreamDumpPath, so the
+        // response phase (including rawChunks) was always lost. Always
+        // write to a self-generated path now so we can see actual wire
+        // data for any provider.
+        const dumpPath = _streamDump.get(state) ?? `/tmp/opencode-llm-dump/response-${Date.now()}.json`
+        try {
+          const fs = require("fs")
+          fs.mkdirSync("/tmp/opencode-llm-dump", { recursive: true })
+          const responsePayload = {
+            phase: "response",
+            ts: new Date().toISOString(),
+            rawChunkCount: state.rawChunks.length,
+            rawChunks: state.rawChunks,
+            finalUsage: event.totalUsage,
+            finalFinishReason: event.finishReason,
+            finalProviderMetadata: "providerMetadata" in event ? event.providerMetadata : undefined,
           }
+          let merged: any = responsePayload
+          try {
+            const existing = JSON.parse(fs.readFileSync(dumpPath, "utf8"))
+            merged = { ...existing, ...responsePayload }
+          } catch {
+            /* no existing — write response-only */
+          }
+          fs.writeFileSync(dumpPath, JSON.stringify(merged, null, 2))
+          console.log(`[LLM_DEBUG] response_dump_written path=${dumpPath} rawChunks=${state.rawChunks.length}`)
+        } catch (e) {
+          console.log(`[LLM_DEBUG] dump_failed error=${e instanceof Error ? e.message : String(e)}`)
         }
         const events = [
           LLMEvent.finish({

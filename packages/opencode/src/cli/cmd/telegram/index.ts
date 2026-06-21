@@ -1821,8 +1821,9 @@ export const TelegramCommand = effectCmd({
     // 409 Conflict: another getUpdates request is active (a previous bot
     // instance still holds the long-poll). Telegram expires that session
     // within ~5-10min after a clean stop, but SIGKILL of the old process
-    // can leave the server-side session alive longer. Retry with backoff
-    // instead of staying broken until a manual restart.
+    // can leave the server-side session alive longer. Use a longer base
+    // (30s) and cap (120s) so we don't hammer telegram while waiting for
+    // the server-side session to expire.
     const launchWithRetry = async () => {
       let attempt = 0
       while (true) {
@@ -1834,7 +1835,8 @@ export const TelegramCommand = effectCmd({
           attempt++
           const msg = eMsg(err)
           const is409 = /409/.test(msg)
-          const delay = is409 ? Math.min(10_000, 2_000 * attempt) : 5_000
+          // 409: 30s base, doubling up to 120s. non-409: 5s fixed.
+          const delay = is409 ? Math.min(120_000, 30_000 * Math.min(4, attempt)) : 5_000
           log.error("bot.launch()", { attempt, message: msg, retryIn: delay })
           await new Promise((r) => setTimeout(r, delay))
         }

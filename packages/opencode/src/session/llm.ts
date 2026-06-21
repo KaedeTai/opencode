@@ -330,6 +330,31 @@ const live: Layer.Layer<
         `perMessage=[${_msgStats.map((m) => `${m.role}:${m.chars}c/${m.estTokens}t`).join(", ")}] ` +
         `dumpPath=${_dumpPath}`,
       )
+      // POISON-2026-06-22: refuse to send a request whose body already
+      // exceeds the model's input window. Some providers (notably
+      // minimax-cn) respond to oversized requests with a 1-2 char
+      // degenerate stream that opencode's SSE parser then surfaces as
+      // garbage to the user. Catching this before the wire saves us from
+      // that round-trip — and lets the existing ContextOverflowError
+      // handler in processor.ts trigger needsCompaction.
+      const _limit = input.model.limit.input || input.model.limit.context
+      if (_limit > 0 && _totalEst > _limit) {
+        yield* Effect.logError("llm refuse: incoming request exceeds model input limit", {
+          providerID: input.model.providerID,
+          modelID: input.model.id,
+          estTokens: _totalEst,
+          limit: _limit,
+          sessionID: input.sessionID,
+        })
+        // ContextOverflowError is a Defect — throwing from a streamText
+        // path is caught by processor.ts halt() which sets needsCompaction
+        // = true, then the runLoop breaks, then the next loop iteration
+        // triggers a compaction task. The user sees an error + compaction,
+        // never the {X garbage.
+        throw new SessionV1.ContextOverflowError({
+          message: `Incoming request is ~${_totalEst} tokens but ${input.model.id} only accepts ${_limit} input tokens. Compact the session and try again.`,
+        })
+      }
       return {
         type: "ai-sdk" as const,
         result: streamText({
@@ -347,7 +372,7 @@ const live: Layer.Layer<
             )
           },
           // Copilot returns the authoritative billed amount only in provider-specific response fields.
-          includeRawChunks: input.model.providerID.includes("github-copilot"),
+          includeRawChunks: input.model.providerID.includes("github-copilot") || input.model.providerID.includes("minimax"),
           async experimental_repairToolCall(failed) {
             const lower = failed.toolCall.toolName.toLowerCase()
             if (lower !== failed.toolCall.toolName && prepared.tools[lower]) {
