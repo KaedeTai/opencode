@@ -1115,12 +1115,7 @@ export function options(input: {
   const modelId = input.model.api.id.toLowerCase()
 
   // MiniMax's Anthropic interface defaults thinking off, unlike Chat Completions.
-  // 2026-06-21 DEBUG: enabling thinking here causes the wire response to start
-  // with a malformed/garbage thinking delta (1-2 chars like "{A" or "{~") which
-  // AI SDK then interprets as an immediate stream end -- the model never gets
-  // to output real content. Disable it until MiniMax actually returns proper
-  // signed thinking blocks; the user has confirmed raw curl to minimax works.
-  if (false && modelId.includes("minimax-m3") && input.model.api.npm === "@ai-sdk/anthropic") {
+  if (modelId.includes("minimax-m3") && input.model.api.npm === "@ai-sdk/anthropic") {
     result["thinking"] = { type: "adaptive" }
   }
 
