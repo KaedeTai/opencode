@@ -6,6 +6,13 @@ import { errorMessage } from "@/util/error"
 type Result = Awaited<ReturnType<typeof streamText>>
 type AISDKEvent = Result["fullStream"] extends AsyncIterable<infer T> ? T : never
 
+// DEBUG-2026-06-21: monotonic timing for prefill -> first-delta -> stream close.
+// We attach a per-stream state object keyed by `state` (passed into every
+// toLLMEvents call for a given stream) via a module-level WeakMap. Each event
+// type logs a [LLM_DEBUG] line with elapsed_ms since stream start.
+type DebugState = { t0: number; firstDeltaLogged: boolean; firstReasoningDeltaLogged: boolean; stepT0: number; stepIndex: number }
+const streamDebug = new WeakMap<object, DebugState>()
+
 export function adapterState() {
   return {
     step: 0,
@@ -77,6 +84,17 @@ export function toLLMEvents(
   state: ReturnType<typeof adapterState>,
   event: AISDKEvent,
 ): Effect.Effect<ReadonlyArray<LLMEvent>, unknown> {
+  // DEBUG-2026-06-21: monotonic timing per stream. `state` is the per-stream
+  // adapterState object; stamp a t0 on first event and emit elapsed_ms on
+  // each one. First text/reasoning delta gets a special FIRST marker so we
+  // can read prefill latency at a glance.
+  let dbg = streamDebug.get(state)
+  if (!dbg) {
+    dbg = { t0: Date.now(), firstDeltaLogged: false, firstReasoningDeltaLogged: false, stepT0: Date.now(), stepIndex: 0 }
+    streamDebug.set(state, dbg)
+  }
+  const elapsed = Date.now() - dbg.t0
+  console.log(`[LLM_DEBUG] +${elapsed}ms type=${event.type}`)
   switch (event.type) {
     case "start":
       return Effect.succeed([])
@@ -135,6 +153,10 @@ export function toLLMEvents(
       })
 
     case "text-delta":
+      if (!dbg.firstDeltaLogged) {
+        dbg.firstDeltaLogged = true
+        console.log(`[LLM_DEBUG] +${elapsed}ms FIRST_TEXT_DELTA text="${event.text.slice(0, 80)}"`)
+      }
       return Effect.succeed([
         LLMEvent.textDelta({
           id: currentTextID(state, event.id),
@@ -262,6 +284,10 @@ export function toLLMEvents(
       })
 
     case "error":
+      // DEBUG-2026-06-21: full error dump — was previously only Effect.fail'd
+      // with no observable content. Stream-Text's onError hook also logs, but
+      // this is the runtime path that actually reaches the processor.
+      console.log(`[LLM_DEBUG] +${elapsed}ms ERROR error=${JSON.stringify(event.error)}`)
       return Effect.fail(event.error)
 
     case "abort":

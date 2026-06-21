@@ -33,9 +33,22 @@ function eventResponse(events: EventV2.Interface) {
     yield* Effect.addFinalizer(() => unsubscribe)
     const stream = Stream.fromQueue(queue).pipe(
       Stream.filter(
-        (event) =>
-          event.location?.directory === instance.directory &&
-          (event.location.workspaceID === undefined || event.location.workspaceID === workspaceID),
+        (event) => {
+          const dirOk = event.location?.directory === instance.directory
+          const wsOk = event.location?.workspaceID === undefined || event.location.workspaceID === workspaceID
+          if (!dirOk || !wsOk) {
+            // DEBUG-2026-06-21: emit filtered-out event so we can see if SSE filter
+            // is dropping message.part.delta events for the dead session
+            const payloadType = (event.payload as { type?: unknown } | undefined)?.type
+            console.log(
+              `[SSE_FILTER] dropped event: payloadType=${String(payloadType)} ` +
+              `eventDir=${String(event.location?.directory)} ` +
+              `instanceDir=${String(instance.directory)} ` +
+              `workspaceOk=${String(wsOk)}`,
+            )
+          }
+          return dirOk && wsOk
+        },
       ),
       Stream.map((event) => ({ id: event.id, type: event.type, properties: event.data })),
     )
