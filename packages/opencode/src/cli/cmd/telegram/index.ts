@@ -856,6 +856,10 @@ export const TelegramCommand = effectCmd({
           setTimeout(() => process.exit(143), 100)
           return
         }
+        if (cmd === "version" || cmd === "v") {
+          await ctx.reply(`Build: 0.0.0-dev-${new Date().toISOString().slice(0, 10).replace(/-/g, "")}${new Date().toISOString().slice(11, 16).replace(":", "")}`)
+          return
+        }
         if (cmd === "start") {
           await ctx.reply("👋 Welcome! Send me any request and I'll help you out.\n\nCommands:\n/new - create session\n/abort - stop task\n/status - show session\n/share - get share link\n/model - show or switch model\n/compact - summarize this session\n/fork - fork at last user message\n/retry - resend last prompt\n/restart - restart bot\n/sessions - list & switch sessions\n/whoami - show your chat ID\n/help - show this")
           return

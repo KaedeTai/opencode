@@ -43,6 +43,151 @@ const OPENAI_HEADER_TIMEOUT_DEFAULT = 10_000
 // differ from what the AI SDK Anthropic protocol parser expects.
 const defaultFetch = undiciFetch
 
+async function detectErrorThenRetry(
+  input: any,
+  opts: any,
+  fetchFn: typeof defaultFetch,
+  streamingRes: Response,
+  chunkAbortCtl: AbortController,
+): Promise<Response> {
+  const ct = streamingRes.headers.get("content-type") || ""
+    if (!ct.includes("text/event-stream")) {
+      const fullText = await streamingRes.text()
+      let sseText = ""
+    try {
+      const json = JSON.parse(fullText)
+      // Minimax non-streaming uses Anthropic format: content is an array of {text, type}
+      // e.g. {"type":"message","content":[{"text":"Hi!","type":"text"}],...}
+      // vs OpenAI: {"choices":[{"message":{"content":"..."}}]}
+      const anthropicContent = json.content?.[0]?.text
+      const openaiContent = json.choices?.[0]?.message?.content
+      const finishReason = json.choices?.[0]?.finish_reason
+      if (finishReason === "abort" || finishReason === "error" || finishReason === "length") {
+        const baseResp = json.base_resp
+        const errMsg = baseResp?.status_msg || baseResp?.status_code !== 0 ? `status_code=${baseResp?.status_code}` : `finish_reason=${finishReason}`
+        const tokens = json.usage?.completion_tokens ?? "?"
+        sseText = formatAsSSE(`[${finishReason}] Request aborted by minimax. ${errMsg}. completion_tokens=${tokens}. Try /new to start a fresh session.`, json.id || "retry")
+      } else if (anthropicContent) {
+        sseText = formatAsSSE(anthropicContent, json.id || "retry")
+      } else if (openaiContent) {
+        sseText = formatAsSSE(openaiContent, json.id || "retry")
+      } else if (json.error) {
+        const errMsg = json.error.message || JSON.stringify(json.error)
+        sseText = formatAsSSE(`[Error] ${errMsg}`, json.id || "retry")
+      } else {
+        sseText = fullText
+      }
+    } catch {
+      sseText = fullText
+    }
+    sseText += "\n\ndata: [DONE]\n\n"
+    return new Response(
+      new ReadableStream({
+        start(c) {
+          c.enqueue(new TextEncoder().encode(sseText))
+          c.close()
+        },
+      }),
+      {
+        status: streamingRes.status,
+        headers: {
+          ...Object.fromEntries(streamingRes.headers.entries()),
+          "content-type": "text/event-stream",
+        },
+      },
+    )
+  }
+  if (!streamingRes.body) {
+    return streamingRes
+  }
+
+  const reader = streamingRes.body.getReader()
+  const decoder = new TextDecoder()
+  const chunks: Uint8Array[] = []
+  let text = ""
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+      chunks.push(value)
+      text += decoder.decode(value, { stream: true })
+    }
+  } catch {
+    // stream error, will retry below
+  }
+
+  // If we got normal SSE chunks (no garbage), pass them through as-is
+  if (!/^\s*\{[A-Za-z0-9]$/m.test(text)) {
+    const body = new ReadableStream({
+      start(c) {
+        for (const chunk of chunks) c.enqueue(chunk)
+        c.close()
+      },
+      cancel() {
+        reader.cancel().catch(() => {})
+      },
+    })
+    return new Response(body, {
+      status: streamingRes.status,
+      headers: streamingRes.headers,
+    })
+  }
+
+  // Garbage detected — cancel the original stream and retry non-streaming
+  chunkAbortCtl.abort()
+  reader.cancel().catch(() => {})
+
+  const nonStreamRes = await fetchFn(input, {
+    ...opts,
+    body: typeof opts.body === "string"
+      ? opts.body.replace(/"stream"\s*:\s*true/g, '"stream":false')
+      : opts.body,
+  })
+
+  const fullText = await nonStreamRes.text()
+
+  // Format non-streaming JSON as SSE chunks for the AI SDK parser
+  let sseText = ""
+  try {
+    const json = JSON.parse(fullText)
+    const msg = json.choices?.[0]?.message
+    if (msg?.content) {
+      sseText = formatAsSSE(msg.content, json.id || "retry")
+    } else if (json.error) {
+      const errMsg = json.error.message || JSON.stringify(json.error)
+      sseText = formatAsSSE(`[Error] ${errMsg}`, json.id || "retry")
+    }
+  } catch {
+    sseText = fullText
+  }
+  sseText += "\n\ndata: [DONE]\n\n"
+
+  return new Response(
+    new ReadableStream({
+      start(c) {
+        c.enqueue(new TextEncoder().encode(sseText))
+        c.close()
+      },
+    }),
+    {
+      status: nonStreamRes.status,
+      headers: {
+        ...Object.fromEntries(nonStreamRes.headers.entries()),
+        "content-type": "text/event-stream",
+      },
+    },
+  )
+}
+
+function formatAsSSE(content: string, id: string): string {
+  // delta should ONLY contain the content field — finish_reason must be at the choices level
+  // Correct SSE format:
+  //   {"id":"...","choices":[{"index":0,"delta":{"content":"..."},"finish_reason":"stop"}]}
+  // WRONG (current): finish_reason inside delta
+  return `data: ${JSON.stringify({ id, choices: [{ index: 0, delta: { content }, finish_reason: "stop" }] })}\n`
+}
+
 function wrapSSE(res: Response, ms: number, ctl: AbortController) {
   if (typeof ms !== "number" || ms <= 0) return res
   if (!res.body) return res
@@ -1693,15 +1838,29 @@ export const layer = Layer.effect(
         if (existing) return existing
 
         const customFetch = options["fetch"]
-        const chunkTimeout = options["chunkTimeout"]
+        const chunkTimeout = options["chunkTimeout"] ?? 60_000
         const headerTimeout = options["headerTimeout"]
         delete options["chunkTimeout"]
         delete options["headerTimeout"]
 
         options["fetch"] = async (input: any, init?: BunFetchRequestInit) => {
           const fetchFn = customFetch ?? defaultFetch
-          const opts = init ?? {}
-          const chunkAbortCtl = typeof chunkTimeout === "number" && chunkTimeout > 0 ? new AbortController() : undefined
+          const opts = { ...init }
+          // POISON-2026-06-22: minimax's streaming SSE returns 1-char garbage
+          // ({C, {H etc.) when the session grows large. Fix: always use
+          // non-streaming for minimax, then format the response as SSE.
+          // Minimax: force non-streaming to avoid SSE garbage chunks.
+          // When non-streaming, skip chunkAbortCtl — wrapSSE's 60s-per-chunk
+          // timeout fires on non-streaming (all bytes arrive at once), aborting
+          // the request before minimax finishes sending the full JSON body.
+          const urlStr = typeof input === "string" ? input : input?.url ?? ""
+          const isMinimax = urlStr.includes("minimax")
+          const isMinimaxStream = isMinimax && typeof opts.body === "string" && /"stream"\s*:\s*true/.test(opts.body)
+          if (isMinimaxStream) {
+            opts.body = (opts.body as string).replace(/"stream"\s*:\s*true/g, '"stream":false')
+          }
+          // Skip chunkAbortCtl for minimax (non-streaming) — prevents premature abort
+          const chunkAbortCtl = (isMinimaxStream && typeof chunkTimeout === "number" && chunkTimeout > 0) ? undefined : (typeof chunkTimeout === "number" && chunkTimeout > 0 ? new AbortController() : undefined)
           const headerTimeoutMs = headerTimeout === false ? undefined : headerTimeout
           const headerTimeoutCtl = typeof headerTimeoutMs === "number" ? timeoutController(headerTimeoutMs) : undefined
           const signals: AbortSignal[] = []
@@ -1722,7 +1881,7 @@ export const layer = Layer.effect(
           }).finally(() => headerTimeoutCtl?.clear())
 
           if (!chunkAbortCtl) return res
-          return wrapSSE(res, chunkTimeout, chunkAbortCtl)
+          return await detectErrorThenRetry(input, opts, fetchFn, res, chunkAbortCtl)
         }
 
         const bundledLoader = BUNDLED_PROVIDERS[model.api.npm]
